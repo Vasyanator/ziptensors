@@ -104,6 +104,38 @@ Reads release the GIL and are safe from many threads. `Member.open()` returns a 
 file object, for example for `torch.load`. Quantized GGUF tensors are never dequantized: they are
 refused by default or handed over as raw blocks (`quantized="raw"` or `"diffusers"`).
 
+## Example: Stable Diffusion with Diffusers
+
+[`examples/diffusers_from_container.py`](examples/diffusers_from_container.py) runs a Diffusers model
+directory (Stable Diffusion 1.x or SDXL, weights in safetensors) straight from a container, without a
+mount and without unpacking the weights. Needs `diffusers`, `transformers`, `torch` and `ziptensors`.
+
+```sh
+ziptensors pack sd15.ziptensors stable-diffusion-v1-5/      # the whole directory: weights, configs, tokenizer
+python examples/diffusers_from_container.py sd15.ziptensors "a lighthouse at sunset" out.png --steps 20 --seed 42
+```
+
+The example restores only the small files (configs, tokenizer, scheduler) to a temporary directory,
+builds each model from its config, and decodes its weights from the container onto the device:
+
+```python
+container = ziptensors.Container("sd15.ziptensors", max_total_decoded=64 << 30)
+container.member("unet/config.json").restore_file(tmp / "unet/config.json")   # likewise every small file
+with torch.device("cuda"):
+    unet = UNet2DConditionModel.from_config(UNet2DConditionModel.load_config(tmp / "unet"))
+unet.to(dtype=torch.float16)
+unet.load_state_dict(load_state_dict(container.member("unet/diffusion_pytorch_model.safetensors"),
+                                     device="cuda"), strict=True)
+# ... the same for vae and text_encoder; tokenizer and scheduler from their restored files
+pipeline = StableDiffusionPipeline(vae=vae, text_encoder=text_encoder, tokenizer=tokenizer, unet=unet,
+                                   scheduler=scheduler, safety_checker=None, feature_extractor=None)
+```
+
+Every weight is bit-exact, so the pipeline is the one `from_pretrained` builds from the original
+directory: in our test (Stable Diffusion 1.5, FP16, 20 steps, fixed seed, ROCm GPU) both wrote the same
+PNG, byte for byte. On Linux and Windows, `ziptensors mount` plus the usual
+`from_pretrained` on the mounted directory is the alternative.
+
 ## Modes
 
 | Mode | What it does | Use it for |
