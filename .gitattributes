@@ -1,0 +1,3 @@
+# Check out text files with LF on every platform: tests compare checked-in text
+# (the C header, golden fixtures) byte for byte against generated output.
+* text=auto eol=lf
