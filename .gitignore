@@ -1,0 +1,12 @@
+# Build output
+target/
+
+# Python virtual environments
+.venv/
+
+# Agent working files, never committed
+CLAUDE.local.md
+STATE.md
+
+# Machine-local notes
+dev-docs/local-notes.md

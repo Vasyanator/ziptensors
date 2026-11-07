@@ -1,0 +1,69 @@
+# Packaging of the Python module `ziptensors`: a Rust extension built by maturin as abi3, plus the
+# pure-Python files of `python/data/platlib/ziptensors/`, which the wheel data directory `data` below
+# installs beside the package maturin generates. The stub `ziptensors.pyi` next to this file is packaged by
+# maturin with a `py.typed` marker, from the tree and from the source distribution (see `include`).
+#
+# Not maturin's mixed layout: there `maturin develop` writes the compiled extension into this tree. A
+# directory called `ziptensors` next to this file, even without `__init__.py`, selects that layout.
+# `platlib`, not `purelib`, because on a distribution where the two differ the package would split.
+
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+name = "ziptensors"
+description = "Lossless tensor containers with random access"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT OR Apache-2.0"
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
+authors = [{ name = "ziptensors contributors" }]
+keywords = ["tensor", "safetensors", "gguf", "compression", "pytorch"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Rust",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Archiving :: Compression",
+    "Typing :: Typed",
+]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/Vasyanator/ziptensors"
+Repository = "https://github.com/Vasyanator/ziptensors"
+Issues = "https://github.com/Vasyanator/ziptensors/issues"
+Changelog = "https://github.com/Vasyanator/ziptensors/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+# `Module.load_state_dict(assign=True)`, which `ziptensors.torch` relies on, arrived in torch 2.1.
+torch = ["torch>=2.1"]
+
+[tool.maturin]
+module-name = "ziptensors"
+data = "python/data"
+# The source distribution moves this file to its root, and `data` and the stub must resolve from there
+# too: maturin looks for `<module-name>.pyi` beside this file only, so a wheel built from the source
+# distribution would otherwise lose the stub and `py.typed`.
+include = [
+    { path = "python/data/**/*.py", format = "sdist" },
+    { path = "ziptensors.pyi", format = "sdist" },
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# No `.pytest_cache` in the tree.
+addopts = "-p no:cacheprovider"

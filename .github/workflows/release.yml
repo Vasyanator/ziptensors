@@ -1,0 +1,214 @@
+# File: .github/workflows/release.yml
+# Purpose: release on a version tag `v*`. Builds the abi3 wheels and the sdist of the Python module and
+# publishes them to PyPI, builds the `ziptensors` CLI and the C library per platform and attaches them
+# to a GitHub release, and publishes the crates to crates.io when a token is configured.
+#
+# Before the first release (once, by the repository owner):
+# - PyPI: add a trusted publisher for the project `ziptensors` (a "pending publisher" while the project
+#   does not exist yet): owner `Vasyanator`, repository `ziptensors`, workflow `release.yml`, environment
+#   `pypi`. Create the environment `pypi` in the repository settings. No API token is stored.
+# - crates.io: the first publish of each crate is manual (`cargo publish --workspace` from a clean
+#   checkout of the tag, with `cargo login`). For later releases either repeat that, or store a token
+#   with the publish-update scope as the secret `CARGO_REGISTRY_TOKEN` in the environment `crates-io`;
+#   without the secret the `crates-io` job skips its publish step.
+# - The tag must equal the workspace version: `v0.1.0` for `version = "0.1.0"`.
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  RUST_TOOLCHAIN: "1.99.1"
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Tag matches the workspace version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: read
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  wheels:
+    name: Wheel ${{ matrix.os }} ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # manylinux_2_28: the C compiler of the container builds zstd; torch needs glibc 2.28 anyway.
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: "2_28"
+          - os: ubuntu-latest
+            target: aarch64
+            manylinux: "2_28"
+          - os: windows-latest
+            target: x64
+            manylinux: ""
+          - os: macos-latest
+            target: x86_64
+            manylinux: ""
+          - os: macos-latest
+            target: aarch64
+            manylinux: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          rust-toolchain: ${{ env.RUST_TOOLCHAIN }}
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux }}
+          args: --release --locked --out dist -m crates/ziptensors-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  sdist:
+    name: Source distribution
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m crates/ziptensors-py/Cargo.toml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  pypi:
+    name: Publish to PyPI
+    needs: [wheels, sdist]
+    runs-on: ubuntu-latest
+    # Trusted publishing: PyPI accepts the OIDC token of this job, for this workflow and environment.
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  binaries:
+    name: Binaries ${{ matrix.target }}
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest hosted Ubuntu, so the binary runs on the widest range of glibc versions.
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-latest
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p ziptensors-cli -p ziptensors-capi
+      - name: Archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          out="target/$TARGET/release"
+          case "$TARGET" in
+            *windows*) exe=ziptensors.exe; libs="ziptensors_capi.dll ziptensors_capi.dll.lib" ;;
+            *apple*) exe=ziptensors; libs=libziptensors_capi.dylib ;;
+            *) exe=ziptensors; libs=libziptensors_capi.so ;;
+          esac
+          cli="ziptensors-cli-$VERSION-$TARGET"
+          capi="ziptensors-capi-$VERSION-$TARGET"
+          mkdir -p "staging/$cli" "staging/$capi/lib" "staging/$capi/include" assets
+          cp "$out/$exe" crates/ziptensors-cli/README.md LICENSE-MIT LICENSE-APACHE "staging/$cli/"
+          for lib in $libs; do cp "$out/$lib" "staging/$capi/lib/"; done
+          cp crates/ziptensors-capi/include/ziptensors.h "staging/$capi/include/"
+          cp crates/ziptensors-capi/README.md LICENSE-MIT LICENSE-APACHE "staging/$capi/"
+          cd staging
+          for dir in "$cli" "$capi"; do
+            if [[ "$TARGET" == *windows* ]]; then
+              7z a "../assets/$dir.zip" "$dir"
+            else
+              tar czf "../assets/$dir.tar.gz" "$dir"
+            fi
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: assets/*
+          if-no-files-found: error
+
+  github-release:
+    name: GitHub release
+    needs: [binaries, wheels, sdist]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: assets
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "$GITHUB_REF_NAME" assets/*
+          --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+
+  crates-io:
+    name: Publish to crates.io
+    needs: [binaries]
+    runs-on: ubuntu-latest
+    environment: crates-io
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Publish
+        # Packages with `publish = false` (ziptensors-py, ziptensors-capi) are skipped; the others go
+        # up in dependency order: core, mount, cli.
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        run: cargo publish --workspace --locked
+      - name: No token
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: echo "::notice::CARGO_REGISTRY_TOKEN is not set; publish the crates by hand (see the header of release.yml)"

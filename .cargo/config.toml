@@ -1,0 +1,4 @@
+# Project cargo aliases. `check-all` covers the two targets checked with plain cargo; macOS goes
+# through cargo-zigbuild (see PROJECT_RULES.md).
+[alias]
+check-all = "check --workspace --all-targets --target x86_64-unknown-linux-gnu --target x86_64-pc-windows-gnu"

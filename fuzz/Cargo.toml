@@ -1,0 +1,58 @@
+# ziptensors-fuzz: fuzz targets over the three surfaces that take untrusted bytes. Nightly, Linux only.
+# Outside the workspace (root `exclude`), with its own lockfile. See MODULE_README.md for how to run it.
+
+[package]
+name = "ziptensors-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ziptensors-core = { path = "../crates/ziptensors-core" }
+# The same pins as the workspace: the harness must see the decoder the library ships.
+zstd = { version = "=0.13.4", default-features = false }
+blake3 = "1.8.7"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+
+[lib]
+path = "src/lib.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "open_and_read"
+path = "fuzz_targets/open_and_read.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_chunk"
+path = "fuzz_targets/decode_chunk.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "profile_scan"
+path = "fuzz_targets/profile_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "make_seeds"
+path = "src/bin/make_seeds.rs"
+test = false
+doc = false
+bench = false
+
+# ASan and bounds checks need debug assertions on, as the in-place proof asserts per step.
+[profile.release]
+debug = 1
+debug-assertions = true
+overflow-checks = true

@@ -1,0 +1,34 @@
+# ziptensors-cli: the `ziptensors` command line tool, a thin frontend over ziptensors-core.
+
+[package]
+name = "ziptensors-cli"
+description = "Command line tool for the ziptensors container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["cli", "tensor", "safetensors", "gguf", "compression"]
+categories = ["command-line-utilities", "compression"]
+
+[[bin]]
+name = "ziptensors"
+path = "src/main.rs"
+
+[dependencies]
+ziptensors-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# The mount command exists only where a backend does: FUSE on Linux, WinFsp on Windows.
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+ziptensors-mount.workspace = true
+
+[dev-dependencies]
+# Only to store the index of a hand-built hostile container.
+zstd.workspace = true

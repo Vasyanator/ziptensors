@@ -1,0 +1,27 @@
+# zt-bench-driver: timing driver of the acceptance benchmark. Linux only.
+# Standalone: its own empty [workspace] keeps it out of the root workspace, so it needs no entry there and
+# no change to the mandatory targets. See ../MODULE_README.md for how it is built and run.
+
+[package]
+name = "zt-bench-driver"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+ziptensors-core = { path = "../../../crates/ziptensors-core" }
+# The same pin as the workspace: the driver parses the index with the decoder the library ships.
+zstd = { version = "=0.13.4", default-features = false }
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+rustix = { version = "1.1", features = ["fs"] }
+
+# The profile the library is released and measured with, copied from the root manifest, which does not
+# apply here because this package is its own workspace.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

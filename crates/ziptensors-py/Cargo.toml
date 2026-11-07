@@ -1,0 +1,25 @@
+# ziptensors-py: Python extension module (abi3, CPython 3.11+) over ziptensors-core.
+
+[package]
+name = "ziptensors-py"
+description = "Python bindings for the ziptensors container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+# Ships through PyPI as the wheel `ziptensors` (pyproject.toml), never through crates.io.
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+# An extension module has no libpython to link against in a test harness; tests run under pytest.
+test = false
+doctest = false
+
+[dependencies]
+ziptensors-core.workspace = true
+pyo3.workspace = true

@@ -1,0 +1,200 @@
+# File: .github/workflows/ci.yml
+# Purpose: continuous integration of the workspace on every push and pull request. It runs the checks of
+# PROJECT_RULES.md "Verification" that a hosted runner can run: clippy and tests on Linux, a clippy cross
+# check for windows-gnu, native tests on Windows (MSVC) and macOS, the MSRV build, the packaging checks of
+# crates.io and PyPI, and the Python tests against an installed wheel.
+#
+# Tests that need hardware or software a runner lacks skip themselves: the WinFsp mount without WinFsp,
+# the C smoke test without `cc`. FUSE is installed on Linux so that the mount test runs there.
+
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The development toolchain of PROJECT_RULES.md; the MSRV of Cargo.toml is checked by `msrv`.
+  RUST_TOOLCHAIN: "1.99.1"
+  MSRV_TOOLCHAIN: "1.92"
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: Linux (clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install FUSE
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y fuse3
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+      - name: No mount left behind
+        run: "! grep ziptensors /proc/mounts"
+
+  windows-gnu-clippy:
+    name: Clippy x86_64-pc-windows-gnu (cross)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-gnu
+      - name: Install MinGW
+        # zstd-sys compiles C for the target.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+
+  windows:
+    name: Windows (MSVC, test)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+
+  macos:
+    name: macOS (arm64, test)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test --workspace --locked
+
+  msrv:
+    name: MSRV build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check
+        run: cargo check --workspace --all-targets --locked
+
+  package:
+    name: Packaging (crates.io, sdist)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: License copies match the root
+        # cargo and maturin package only files inside a package directory, so each published package
+        # carries copies of the license texts.
+        run: |
+          for crate in core mount cli py; do
+            for license in LICENSE-MIT LICENSE-APACHE; do
+              cmp "$license" "crates/ziptensors-$crate/$license"
+            done
+          done
+      - name: crates.io dry run
+        run: cargo publish --dry-run --workspace --locked
+      - name: Wheel from the source distribution keeps the stub
+        # A wheel built from the sdist alone must carry `__init__.pyi` and `py.typed`, like one built
+        # from the tree.
+        run: |
+          python -m pip install "maturin>=1.16,<2"
+          maturin sdist -m crates/ziptensors-py/Cargo.toml --out "$RUNNER_TEMP/sdist"
+          python -m pip wheel --no-deps -w "$RUNNER_TEMP/wheel" "$RUNNER_TEMP"/sdist/ziptensors-*.tar.gz
+          python - "$RUNNER_TEMP"/wheel/ziptensors-*.whl <<'EOF'
+          import sys, zipfile
+          names = zipfile.ZipFile(sys.argv[1]).namelist()
+          wanted = ("ziptensors/__init__.pyi", "ziptensors/py.typed", "platlib/ziptensors/torch.py")
+          missing = [suffix for suffix in wanted if not any(name.endswith(suffix) for name in names)]
+          if missing:
+              sys.exit(f"the wheel built from the sdist lacks {missing}")
+          EOF
+
+  python:
+    name: Python ${{ matrix.python }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The abi3 floor, with the optional test dependencies; torch from the CPU-only index.
+          - os: ubuntu-latest
+            python: "3.11"
+            torch: true
+          - os: windows-latest
+            python: "3.13"
+            torch: false
+          - os: macos-latest
+            python: "3.13"
+            torch: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Build and install the wheel
+        # The installed wheel, not `maturin develop`: it also proves the wheel data directory and the
+        # stub install, and nothing is written into the tree.
+        shell: bash
+        run: |
+          python -m pip install "maturin>=1.16,<2" "pytest>=8" numpy xxhash safetensors
+          maturin build --release -m crates/ziptensors-py/Cargo.toml --out "$RUNNER_TEMP/dist"
+          python -m pip install "$RUNNER_TEMP"/dist/ziptensors-*.whl
+      - name: Install torch (CPU) and gguf
+        if: matrix.torch
+        # The CPU-only index keeps the CUDA libraries of the PyPI build off the runner.
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install gguf
+      - name: pytest
+        shell: bash
+        working-directory: crates/ziptensors-py
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python -m pytest -p no:cacheprovider

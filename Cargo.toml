@@ -1,0 +1,59 @@
+# Workspace manifest for ziptensors: lossless tensor container (core library, C ABI, Python module, CLI,
+# read-only mount).
+# Versions shared by several crates live in [workspace.dependencies]; the format itself is owned by spec/ziptensors-format.md.
+
+[workspace]
+resolver = "3"
+members = [
+    "crates/ziptensors-core",
+    "crates/ziptensors-capi",
+    "crates/ziptensors-py",
+    "crates/ziptensors-cli",
+    "crates/ziptensors-mount",
+]
+# `dev-docs` holds a standalone prototype crate; `fuzz` needs nightly and has its own lockfile.
+exclude = ["dev-docs", "fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+# The lowest toolchain proven to build the workspace; the `msrv` CI job keeps it so. Development uses
+# the toolchain PROJECT_RULES.md names.
+rust-version = "1.92"
+license = "MIT OR Apache-2.0"
+authors = ["ziptensors contributors"]
+repository = "https://github.com/Vasyanator/ziptensors"
+homepage = "https://github.com/Vasyanator/ziptensors"
+
+[workspace.dependencies]
+ziptensors-core = { path = "crates/ziptensors-core", version = "0.1.0" }
+ziptensors-mount = { path = "crates/ziptensors-mount", version = "0.1.0" }
+# Exact pin: the measured version; a bump needs a benchmark rerun. No default features, so the
+# legacy decoders stay out of reach of untrusted input.
+zstd = { version = "=0.13.4", default-features = false }
+blake3 = "1.8.7"
+xxhash-rust = { version = "0.8.19", features = ["xxh3"] }
+rayon = "1.12"
+thiserror = "2.0"
+tracing = "0.1.44"
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+tracing-subscriber = "0.3.23"
+pyo3 = { version = "0.30.1", features = ["abi3-py311"] }
+cbindgen = "0.29.4"
+# Linux only, for ziptensors-mount. Exact pin: the FUSE protocol surface the mount was checked
+# against. No default features: the pure-Rust mount through /dev/fuse and fusermount3, no libfuse.
+fuser = { version = "=0.18.0", default-features = false }
+# The version fuser already uses, so the graph holds one nix.
+nix = { version = "0.31", default-features = false, features = ["fs", "pthread", "signal", "user"] }
+# Windows only, for the WinFsp backend of ziptensors-mount: every Win32 call it makes. The version
+# already in the graph through clap's terminal crates; each user picks its features.
+windows-sys = "0.61.2"
+
+# The configuration the feasibility throughput numbers were measured with. Unwinding stays on
+# because the C ABI relies on catch_unwind at every entry.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false

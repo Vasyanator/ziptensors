@@ -1,0 +1,51 @@
+# ziptensors-mount: a read-only filesystem view of a container. The tree, name policies and the
+# backend-neutral facade build on every target; the FUSE backend is Linux only, the WinFsp backend
+# Windows only.
+
+[package]
+name = "ziptensors-mount"
+description = "Read-only filesystem view of a ziptensors container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/ziptensors-mount"
+readme = "README.md"
+keywords = ["fuse", "winfsp", "tensor", "safetensors", "mount"]
+categories = ["filesystem", "compression"]
+
+[dependencies]
+ziptensors-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# fuser's build script panics on Windows and macOS, so it can only be a Linux dependency. nix is
+# already in its graph; the mount uses it for the signal wait and the owner of the files.
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser.workspace = true
+nix.workspace = true
+
+# The WinFsp backend loads winfsp-x64.dll at run time (no import library, no build-time dependency on
+# WinFsp) and reaches Win32 through windows-sys alone.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }
+
+# The integration test maps a mounted file and finds a free drive letter.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Memory"] }
+
+# Each backend sits behind its own `cfg`, so docs.rs documents the two targets that have one.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

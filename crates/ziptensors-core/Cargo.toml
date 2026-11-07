@@ -1,0 +1,24 @@
+# ziptensors-core: container format, codecs, profiles, reader and writer. All logic lives here.
+
+[package]
+name = "ziptensors-core"
+description = "Lossless compressed tensor container: format, codecs, reader and writer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/ziptensors-core"
+readme = "README.md"
+keywords = ["tensor", "safetensors", "gguf", "compression", "lossless"]
+categories = ["compression", "encoding", "artificial-intelligence"]
+
+[dependencies]
+zstd.workspace = true
+blake3.workspace = true
+xxhash-rust.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

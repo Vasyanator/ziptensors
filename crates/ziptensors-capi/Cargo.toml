@@ -1,0 +1,30 @@
+# ziptensors-capi: stable C ABI over ziptensors-core, shipped as a cdylib with a generated header.
+
+[package]
+name = "ziptensors-capi"
+description = "C ABI for the ziptensors container"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+# Not on crates.io: the product is the shared library and `include/ziptensors.h`, which C users take
+# from a GitHub release; the rlib exists only for the crate's own tests, so a crates.io release would
+# promise a Rust API nobody should depend on.
+publish = false
+
+[lib]
+# The cdylib is the product. The rlib is no shipped artefact: `cargo test` builds the cdylib for an
+# integration test only if the library is linkable, and `tests/c_smoke.rs` needs that file.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+ziptensors-core.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+cbindgen.workspace = true
