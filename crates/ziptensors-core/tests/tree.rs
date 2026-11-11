@@ -642,14 +642,28 @@ mod unix {
     }
 
     #[test]
-    fn special_files_and_names_that_are_not_utf8_are_skipped() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
+    fn special_files_are_skipped() {
         use std::os::unix::net::UnixListener;
 
         let scratch = Scratch::new("special");
         let socket = scratch.path("model.sock");
         let _listener = UnixListener::bind(&socket).expect("a socket file");
+        let before = snapshot(&scratch.0);
+        let report = compress_tree(&scratch.0, &compress_options()).expect("runs");
+        assert!(matches!(status_of(&report, &socket), FileStatus::Skipped(SkipReason::Special)));
+        assert_eq!(snapshot(&scratch.0), before);
+    }
+
+    #[test]
+    #[cfg_attr(
+        target_vendor = "apple",
+        ignore = "APFS and HFS+ refuse to create a name that is not UTF-8 (EILSEQ)"
+    )]
+    fn names_that_are_not_utf8_are_skipped() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let scratch = Scratch::new("non-utf8");
         let odd = scratch.0.join(OsStr::from_bytes(b"w\xff.safetensors"));
         fs::write(&odd, safetensors(131)).expect("odd name");
         let odd_dir = scratch.0.join(OsStr::from_bytes(b"d\xfe"));
@@ -657,7 +671,6 @@ mod unix {
         fs::write(odd_dir.join("inner.safetensors"), safetensors(132)).expect("inside");
         let before = snapshot(&scratch.0);
         let report = compress_tree(&scratch.0, &compress_options()).expect("runs");
-        assert!(matches!(status_of(&report, &socket), FileStatus::Skipped(SkipReason::Special)));
         assert!(matches!(status_of(&report, &odd), FileStatus::Skipped(SkipReason::NonUtf8)));
         assert!(matches!(status_of(&report, &odd_dir), FileStatus::Skipped(SkipReason::NonUtf8)));
         assert_eq!(snapshot(&scratch.0), before);
