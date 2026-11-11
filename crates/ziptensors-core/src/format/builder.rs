@@ -3,6 +3,9 @@
 //!
 //! Main responsibilities:
 //! - collect records and hand back the ids other records refer to by;
+//! - start from the storage records of an existing index, [`IndexBuilder::seed`], for an edit that
+//!   keeps its blobs, or from a subset of its blobs renumbered in order,
+//!   [`IndexBuilder::seed_subset`], for an edit that drops the others;
 //! - lay out the section table and the bodies in [`IndexBuilder::serialize`].
 //!
 //! Key structures: [`IndexBuilder`].
@@ -16,15 +19,15 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::index::{
-    BLOB, BODY_ALIGN, CHAN, CHNK, CHST, EXTN, FLAG_REQUIRED, MEMB, PARM, SHAP, STRS, SectionSpec,
-    TABLE_ENTRY_LEN, TABLE_HEADER_LEN, TENS,
+    BLOB, BODY_ALIGN, CHAN, CHNK, CHST, EXTN, FLAG_REQUIRED, Index, MEMB, PARM, SHAP, STRS,
+    SectionSpec, TABLE_ENTRY_LEN, TABLE_HEADER_LEN, TENS,
 };
 use super::records::{
     BlobRecord, ChainRecord, ChunkRecord, ExtentRecord, MemberRecord, PARAMS_ALIGN_LEN, StrRef,
     TensorRecord, encode_step,
 };
 use super::wire::malformed;
-use crate::chain::{Chain, RawStep, Step};
+use crate::chain::{BLOB_KIND_DELTA, Chain, RawStep, Step};
 use crate::error::Error;
 
 /// `section_count` of an index without `PARM`: the mandatory sections, which every index has.
@@ -48,6 +51,14 @@ pub struct IndexBuilder {
     chain_ids: HashMap<Chain, u32>,
 }
 
+/// Fails unless a record re-added by [`IndexBuilder::seed`] got the id it had in the source.
+fn check_same_id(section: &'static str, expected: usize, got: u64) -> Result<(), Error> {
+    if u64::try_from(expected).ok() == Some(got) {
+        return Ok(());
+    }
+    Err(malformed(section, format!("seeded record {expected} came back as id {got}")))
+}
+
 /// The next id of an array whose ids are `u32`.
 fn next_u32(len: usize, section: &'static str) -> Result<u32, Error> {
     u32::try_from(len).map_err(|_| malformed(section, "too many records for a u32 id"))
@@ -58,6 +69,133 @@ impl IndexBuilder {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A builder holding every `CHST` and `CHAN` record of `index` with its id, each id checked.
+    /// Seeded chains are known to [`IndexBuilder::add_chain`]: the first of equal chains is the one
+    /// it would have returned.
+    ///
+    /// # Errors
+    /// [`Error::MalformedIndex`] if a chain does not resolve or a record comes back with another id.
+    fn with_chains_of(index: &Index) -> Result<Self, Error> {
+        let mut builder = Self::new();
+        for (expected, step) in index.steps().iter().enumerate() {
+            let id = builder.add_raw_step(*step)?;
+            check_same_id(CHST.tag, expected, u64::from(id))?;
+        }
+        for (expected, record) in index.chains().iter().enumerate() {
+            let id = builder.add_raw_chain(*record)?;
+            check_same_id(CHAN.tag, expected, u64::from(id))?;
+            builder.chain_ids.entry(index.chain(id)?).or_insert(id);
+        }
+        Ok(builder)
+    }
+
+    /// A builder holding the storage records of `index`: its `CHST` and `CHAN` records, its `BLOB`
+    /// records, its `CHNK` records and the `PARM` entry of each delta blob, re-added in id order so
+    /// that every step, chain, blob and chunk keeps its id, which is checked record by record.
+    /// Strings, members, extents, tensors and shapes are not carried: the caller adds the members
+    /// it keeps. Seeded chains are known to [`IndexBuilder::add_chain`], so an equal chain added
+    /// later shares the seeded record.
+    ///
+    /// `rebase` maps the `file_offset` of every chunk record to its offset in the new file: the
+    /// identity for an edit that keeps the data region in place, or a move map. A delta blob's
+    /// `PARM` entry is re-added with [`IndexBuilder::add_params`], so its `params_off` is that of
+    /// the new heap; its base keeps its id and the entry its bytes.
+    ///
+    /// `index` must have passed [`super::validate`]; an unvalidated one may fail here.
+    ///
+    /// # Errors
+    /// - Any error of `rebase`, which ends the seed.
+    /// - [`Error::MalformedIndex`] if a chain or a delta blob's `PARM` entry does not resolve, or a
+    ///   record comes back with another id, which a validated index and an empty builder rule out.
+    pub fn seed(
+        index: &Index,
+        mut rebase: impl FnMut(u64) -> Result<u64, Error>,
+    ) -> Result<Self, Error> {
+        let mut builder = Self::with_chains_of(index)?;
+        for (expected, blob) in index.blobs().iter().enumerate() {
+            let mut record = *blob;
+            if blob.kind == BLOB_KIND_DELTA {
+                let params = index.delta_params(blob)?;
+                (record.params_off, record.params_len) = builder.add_params(&params.encode())?;
+            }
+            let id = builder.add_blob(record)?;
+            check_same_id(BLOB.tag, expected, u64::from(id))?;
+        }
+        for (expected, chunk) in index.chunks().iter().enumerate() {
+            let file_offset = rebase(chunk.file_offset)?;
+            let id = builder.add_chunk(ChunkRecord { file_offset, ..*chunk });
+            check_same_id(CHNK.tag, expected, id)?;
+        }
+        tracing::debug!(
+            chains = builder.chains.len(),
+            blobs = builder.blobs.len(),
+            chunks = builder.chunks.len(),
+            params = builder.params.len(),
+            "seeded index builder"
+        );
+        Ok(builder)
+    }
+
+    /// A builder holding only the blobs `kept` of `index` (ids in strictly increasing order), for
+    /// an edit that drops the others from the file. Every `CHST` and `CHAN` record is carried with
+    /// its id, as in [`IndexBuilder::seed`]. The kept blobs get the ids `0..kept.len()` in the order
+    /// of `kept`, so a delta blob's base, which has a lower id in `index` (spec invariant 13), keeps
+    /// a lower id; its `PARM` entry is re-added with the base's new id. The chunks of each kept blob
+    /// are re-added after those of the blob before, with `first_chunk` set to match, and each chunk
+    /// record's `file_offset` replaced by `rebase(record)`. Two blobs that shared chunk records get
+    /// a copy each, with equal offsets, which invariant 4 allows.
+    ///
+    /// Returns the builder and, per blob id of `index`, its new id, or `None` for a dropped blob.
+    ///
+    /// `index` must have passed [`super::validate`].
+    ///
+    /// # Errors
+    /// - Any error of `rebase`, which ends the seed.
+    /// - [`Error::MalformedIndex`] if `kept` is not strictly increasing, names a blob `index` does
+    ///   not have, keeps a delta blob without its base, or if a chain or `PARM` entry does not
+    ///   resolve.
+    pub(crate) fn seed_subset(
+        index: &Index,
+        kept: &[u32],
+        mut rebase: impl FnMut(&ChunkRecord) -> Result<u64, Error>,
+    ) -> Result<(Self, Vec<Option<u32>>), Error> {
+        let mut builder = Self::with_chains_of(index)?;
+        let mut ids = vec![None; index.blobs().len()];
+        let mut previous: Option<u32> = None;
+        for &old in kept {
+            if previous.is_some_and(|previous| previous >= old) {
+                return Err(malformed(BLOB.tag, format!("kept blob {old} is out of order")));
+            }
+            previous = Some(old);
+            let missing = || malformed(BLOB.tag, format!("kept blob {old} does not exist"));
+            let at = usize::try_from(old).map_err(|_| missing())?;
+            let blob = *index.blobs().get(at).ok_or_else(missing)?;
+            let mut record = blob;
+            if blob.kind == BLOB_KIND_DELTA {
+                let mut params = index.delta_params(&blob)?;
+                let base = usize::try_from(params.base_blob).ok().and_then(|base| ids.get(base));
+                let lost = format!("kept delta blob {old} lost its base {}", params.base_blob);
+                params.base_blob =
+                    base.copied().flatten().ok_or_else(|| malformed(BLOB.tag, lost))?;
+                (record.params_off, record.params_len) = builder.add_params(&params.encode())?;
+            }
+            // Lossless: `usize` is at most 64 bits on every supported target.
+            record.first_chunk = builder.chunks.len() as u64;
+            for chunk in index.blob_chunks(&blob)? {
+                let file_offset = rebase(chunk)?;
+                builder.chunks.push(ChunkRecord { file_offset, ..*chunk });
+            }
+            ids[at] = Some(builder.add_blob(record)?);
+        }
+        tracing::debug!(
+            blobs = builder.blobs.len(),
+            dropped = index.blobs().len() - builder.blobs.len(),
+            chunks = builder.chunks.len(),
+            "seeded index builder with a subset of the blobs"
+        );
+        Ok((builder, ids))
     }
 
     /// Adds a string to the heap. Equal strings are not merged.
@@ -251,6 +389,8 @@ impl IndexBuilder {
 mod tests {
     use super::IndexBuilder;
     use crate::chain::{Chain, ElementWidth, Layout, Step};
+    use crate::format::records::ChunkRecord;
+    use crate::error::Error;
     use crate::format::index::Index;
     use crate::format::limits::Limits;
     use crate::format::testkit::{Fixture, read_u64};
@@ -377,6 +517,114 @@ mod tests {
         assert_eq!(index.tensors(), fixture.tensors.as_slice());
         assert_eq!(index.dims(), fixture.dims.as_slice());
         assert_eq!(Fixture::from_index(&index).serialize(), raw);
+    }
+
+    /// Seeds from `fixture` with `rebase` and parses the result.
+    fn seeded(fixture: &Fixture, rebase: impl FnMut(u64) -> Result<u64, Error>) -> Index {
+        let source = fixture.check().expect("a valid fixture");
+        let builder = IndexBuilder::seed(&source, rebase).expect("seeds");
+        Index::parse(&builder.serialize(), &Limits::default()).expect("parses")
+    }
+
+    #[test]
+    fn a_seed_carries_storage_records_with_their_ids() {
+        for fixture in [Fixture::valid(), Fixture::with_delta()] {
+            let index = seeded(&fixture, Ok);
+            assert_eq!(index.steps(), fixture.steps.as_slice());
+            assert_eq!(index.chains(), fixture.chains.as_slice());
+            assert_eq!(index.blobs(), fixture.blobs.as_slice());
+            assert_eq!(index.chunks(), fixture.chunks.as_slice());
+            assert_eq!(index.params(), fixture.params.as_slice());
+            assert_eq!(index.params_required(), !fixture.params.is_empty());
+            assert_eq!(index.strings(), []);
+            assert_eq!(index.members(), []);
+            assert_eq!(index.extents(), []);
+            assert_eq!(index.tensors(), []);
+            assert_eq!(index.dims(), []);
+        }
+    }
+
+    #[test]
+    fn a_seed_rebases_every_chunk_offset() {
+        let fixture = Fixture::with_delta();
+        let index = seeded(&fixture, |offset| Ok(offset + 1000));
+        let offsets: Vec<u64> = index.chunks().iter().map(|chunk| chunk.file_offset).collect();
+        let expected: Vec<u64> =
+            fixture.chunks.iter().map(|chunk| chunk.file_offset + 1000).collect();
+        assert_eq!(offsets, expected);
+    }
+
+    #[test]
+    fn a_failed_rebase_ends_the_seed() {
+        let source = Fixture::valid().check().expect("a valid fixture");
+        let error = IndexBuilder::seed(&source, |_| Err(Error::Zstd { detail: "x".into() }))
+            .expect_err("the rebase fails");
+        assert!(matches!(error, Error::Zstd { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn a_subset_seed_renumbers_kept_blobs_in_order_and_remaps_delta_bases() {
+        let fixture = Fixture::with_delta();
+        let source = fixture.check().expect("a valid fixture");
+        // Blob 1 is dropped; blob 2, a delta over blob 0, becomes blob 1.
+        let (builder, ids) =
+            IndexBuilder::seed_subset(&source, &[0, 2], |chunk| Ok(chunk.file_offset + 1000))
+                .expect("seeds");
+        assert_eq!(ids, [Some(0), None, Some(1)]);
+        let index = Index::parse(&builder.serialize(), &Limits::default()).expect("parses");
+        assert_eq!(index.steps(), fixture.steps.as_slice());
+        assert_eq!(index.chains(), fixture.chains.as_slice());
+        let blobs = index.blobs();
+        assert_eq!(blobs.len(), 2);
+        assert_eq!(blobs[0], fixture.blobs[0]);
+        assert_eq!((blobs[1].first_chunk, blobs[1].chunk_count), (3, 2));
+        assert_eq!(blobs[1].kind, fixture.blobs[2].kind);
+        let params = index.delta_params(&blobs[1]).expect("resolves");
+        assert_eq!((params.base_blob, params.base_offset), (0, 4));
+        assert!(index.params_required());
+        let kept_chunks = [0, 1, 2, 5, 6].map(|at| fixture.chunks[at]);
+        let expected: Vec<_> = kept_chunks
+            .iter()
+            .map(|chunk| ChunkRecord { file_offset: chunk.file_offset + 1000, ..*chunk })
+            .collect();
+        assert_eq!(index.chunks(), expected.as_slice());
+    }
+
+    #[test]
+    fn a_subset_seed_refuses_a_delta_without_its_base_and_bad_ids() {
+        let source = Fixture::with_delta().check().expect("a valid fixture");
+        let malformed = |kept: &[u32]| {
+            let error = IndexBuilder::seed_subset(&source, kept, |chunk| Ok(chunk.file_offset))
+                .expect_err("refused");
+            assert!(matches!(error, Error::MalformedIndex { section: "BLOB", .. }), "{error:?}");
+        };
+        malformed(&[1, 2]);
+        malformed(&[2, 0]);
+        malformed(&[0, 0]);
+        malformed(&[3]);
+        let (builder, ids) =
+            IndexBuilder::seed_subset(&source, &[], |chunk| Ok(chunk.file_offset)).expect("seeds");
+        assert_eq!(ids, [None, None, None]);
+        let index = Index::parse(&builder.serialize(), &Limits::default()).expect("parses");
+        assert_eq!((index.blobs(), index.chunks()), ([].as_slice(), [].as_slice()));
+        assert!(!index.params_required(), "no delta blob, no PARM");
+    }
+
+    #[test]
+    fn a_seeded_chain_is_shared_by_an_equal_chain_added_later() {
+        let fixture = Fixture::valid();
+        let source = fixture.check().expect("a valid fixture");
+        let mut builder = IndexBuilder::seed(&source, Ok).expect("seeds");
+        for id in 0..u32::try_from(fixture.chains.len()).expect("few") {
+            assert_eq!(builder.add_chain(source.chain(id).expect("resolves")).expect("fits"), id);
+        }
+        let new = Chain::new(&[
+            Step::Rotl1(ElementWidth::Eight),
+            Step::Layout(Layout::Planes(ElementWidth::Eight)),
+        ])
+        .expect("valid");
+        let next = u32::try_from(fixture.chains.len()).expect("few");
+        assert_eq!(builder.add_chain(new).expect("fits"), next);
     }
 
     #[test]

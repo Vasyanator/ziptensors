@@ -4,11 +4,15 @@
 //!
 //! Main responsibilities:
 //! - dispatch to one parser by magic or structure, never by file name;
-//! - the rule that a malformed input degrades to an opaque plan and only real I/O failure is `Err`.
+//! - the rule that a malformed input degrades to an opaque plan and only real I/O failure is `Err`;
+//! - the single "is this a weight file" predicate, [`classify_weight`], over `scan` and the legacy
+//!   torch detector.
 //!
-//! Key functions: [`scan`], and the re-exported [`normalize`] and [`width_trial`].
+//! Key functions: [`scan`], [`classify_weight`], and the re-exported [`normalize`] and
+//! [`width_trial`].
 //!
-//! Key structures: [`Stop`], the internal outcome that separates "give up" from "I/O failed".
+//! Key structures: [`Stop`], the internal outcome that separates "give up" from "I/O failed";
+//! [`WeightKind`], the answer of the predicate.
 //!
 //! Implementation notes: a parser's output picks codecs and names tensors and is never trusted for
 //! restore. `scan` returns what the parser saw, so a caller must pass the plan through
@@ -17,6 +21,7 @@
 
 mod gguf;
 mod json;
+mod legacy_torch;
 mod onnx;
 mod plan;
 mod pt_zip;
@@ -96,6 +101,47 @@ pub fn scan(src: &dyn RandomAccess) -> Result<RangePlan, Error> {
         "scan finished"
     );
     Ok(plan)
+}
+
+/// Format of a file that [`classify_weight`] accepts as a weight file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WeightKind {
+    /// A parser of [`scan`] recognized the file; never [`Profile::Opaque`] or
+    /// [`Profile::Unknown`].
+    Parsed(Profile),
+    /// A legacy (pre-1.6, pickle stream) `torch.save` file, recognized by its first bytes only.
+    /// It has no profile and is compressed as opaque bytes.
+    LegacyTorch,
+}
+
+/// Decides by content alone whether `src` is a weight file, and names its format.
+///
+/// `Some(Parsed(p))` when [`scan`] recognizes a tensor format (any profile other than opaque),
+/// even one with no tensors or with truncated tensor data; otherwise `Some(LegacyTorch)` when the
+/// file starts with the pickle of torch's legacy magic number; otherwise `None`. Size and name
+/// play no part. A wrong `Some` costs compression ratio only, since compression is lossless.
+/// Missed: a header the parser gives up on (truncated, corrupt), and legacy saves the detector
+/// cannot see (custom `pickle_module`, pickle protocol 6 or later).
+///
+/// # Errors
+/// Returns the error of a failed read of `src`, as [`scan`] does. Unrecognized content is `None`,
+/// never an error.
+pub fn classify_weight(src: &dyn RandomAccess) -> Result<Option<WeightKind>, Error> {
+    let len = src.len();
+    let plan = scan(src)?;
+    let kind = match plan.profile {
+        Profile::Safetensors | Profile::Gguf | Profile::Onnx | Profile::PtZip => {
+            Some(WeightKind::Parsed(plan.profile))
+        }
+        Profile::Opaque | Profile::Unknown(_) => legacy_torch::matches(src)
+            .inspect_err(|error| {
+                tracing::error!(len, %error, "reading the source failed in the legacy torch check");
+            })?
+            .then_some(WeightKind::LegacyTorch),
+    };
+    tracing::debug!(len, ?kind, "weight classification finished");
+    Ok(kind)
 }
 
 /// Picks and runs a parser. A file nothing recognizes is an opaque plan and not a failure.

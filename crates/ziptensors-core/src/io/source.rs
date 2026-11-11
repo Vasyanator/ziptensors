@@ -3,7 +3,8 @@
 //!
 //! Main responsibilities:
 //! - the [`RandomAccess`] trait all parsers and the reader go through;
-//! - [`FileSource`], its implementation over the operating system's positional read.
+//! - [`FileSource`], its implementation over the operating system's positional read, from a path or
+//!   from a handle the caller opened.
 //!
 //! Key structures: [`RandomAccess`], [`FileSource`].
 //!
@@ -52,8 +53,20 @@ impl FileSource {
     /// Returns [`Error::Io`] if the file cannot be opened or its metadata read, or if `path` is
     /// not a regular file.
     pub fn open(path: &Path) -> Result<Self, Error> {
+        let file = File::open(path)
+            .map_err(|source| Error::Io { op: "open", path: path.to_path_buf(), source })?;
+        Self::from_file(file, path)
+    }
+
+    /// A source over `file`, already open for reading, which was opened from `path`. For a caller
+    /// that must read and write one file through one handle, with no second resolution of its path:
+    /// an append reads the container it extends through the handle it writes with.
+    ///
+    /// # Errors
+    /// Returns [`Error::Io`] if the metadata of `file` cannot be read, or if it is not a regular
+    /// file.
+    pub(crate) fn from_file(file: File, path: &Path) -> Result<Self, Error> {
         let io_error = |op, source| Error::Io { op, path: path.to_path_buf(), source };
-        let file = File::open(path).map_err(|e| io_error("open", e))?;
         let meta = file.metadata().map_err(|e| io_error("metadata", e))?;
         if !meta.is_file() {
             let source = io::Error::new(io::ErrorKind::InvalidInput, "not a regular file");

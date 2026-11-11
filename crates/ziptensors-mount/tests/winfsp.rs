@@ -2,7 +2,8 @@
 //! Purpose: the Windows WinFsp backend end to end: mount a real container on a new directory and on a
 //! free drive letter, read every member through Windows (whole, positional, through a file mapping),
 //! compare with the bytes it was packed from, check that every change is refused, and check that an
-//! unmount detaches at once while open files and mappings are served until closed.
+//! unmount detaches at once while open files and mappings are served until closed. An overlay of a
+//! model directory with per-file containers is mounted and read the same way.
 //!
 //! Implementation notes: skips with one line on stderr when WinFsp cannot be loaded (`probe`), so it
 //! passes under wine and on machines without WinFsp. Every `MountHandle` unmounts when dropped, also
@@ -30,9 +31,9 @@ use windows_sys::Win32::System::Memory::{
 };
 
 use ziptensors_core::{CacheOptions, Container, OpenOptions, ReadCache};
-use ziptensors_mount::{MountFs, MountHandle, WinFspOptions, WindowsPolicy, mount, probe};
+use ziptensors_mount::{MountFs, MountHandle, OverlayOptions, WinFspOptions, WindowsPolicy, mount, probe};
 
-use testkit::{Fixture, Scratch};
+use testkit::{Fixture, OverlayFixture, Scratch};
 
 /// `MAXIMUM_ALLOWED`, what Explorer asks for: every right the security descriptor grants.
 const MAXIMUM_ALLOWED: u32 = 0x0200_0000;
@@ -122,7 +123,7 @@ fn free_drive() -> Option<char> {
 fn unmount_in_background(handle: MountHandle) -> mpsc::Receiver<()> {
     let (done, finished) = mpsc::channel();
     thread::spawn(move || {
-        handle.unmount();
+        handle.unmount().expect("unmount");
         // The receiver may be gone if the test already failed.
         done.send(()).ok();
     });
@@ -178,7 +179,7 @@ fn a_directory_mount_reads_back_every_member_and_refuses_changes() {
     assert!(File::create(mountpoint.join("new.bin")).is_err(), "created a file");
     assert!(fs::create_dir(mountpoint.join("newdir")).is_err(), "created a directory");
     assert!(fs::remove_dir_all(mountpoint.join("models")).is_err(), "removed a directory");
-    handle.unmount();
+    handle.unmount().expect("unmount");
     assert!(!mountpoint.exists(), "the mount point directory is left behind");
 }
 
@@ -198,7 +199,7 @@ fn a_drive_mount_appears_and_goes() {
     assert_eq!(handle.mountpoint(), root);
     let (name, content) = &fixture.files[1];
     assert_eq!(&fs::read(member(&root, name)).expect("read"), content);
-    handle.unmount();
+    handle.unmount().expect("unmount");
     assert!(!root.exists(), "{} is still there", root.display());
 }
 
@@ -242,4 +243,42 @@ fn an_unmount_detaches_at_once_and_waits_for_open_files_and_mappings() {
     assert!(finished.try_recv().is_err(), "the unmount did not wait for the mapping");
     drop(mapping);
     finished.recv_timeout(SETTLE).expect("the unmount ends once the mapping is gone");
+}
+
+#[test]
+fn an_overlay_mount_serves_a_model_directory_and_fails_reads_of_a_changed_file() {
+    if !winfsp_available() {
+        return;
+    }
+    let scratch = Scratch::new("winfsp-overlay");
+    let fixture = OverlayFixture::standard(&scratch);
+    let mountpoint = scratch.path().join("mnt");
+    let overlay = MountFs::overlay(&fixture.root, WindowsPolicy::default(), &OverlayOptions::default()).expect("mountable");
+    let options = WinFspOptions { threads: 2, long_paths: false };
+    let handle = mount(Arc::new(overlay), &mountpoint, &options).expect("mount");
+    // Changed on disk before any read through the mount: its reads fail, never mixing bytes.
+    let changed = "notes/readme.txt";
+    fs::write(member(&fixture.root, changed), b"a different and longer text than the snapshot had").expect("rewrite");
+    for (name, content) in &fixture.shown {
+        let path = member(&mountpoint, name);
+        if name == changed {
+            assert!(fs::read(&path).is_err(), "{name}: a changed file is read");
+            continue;
+        }
+        assert_eq!(&fs::read(&path).expect("whole read"), content, "{name}");
+        if content.len() > 100_000 {
+            let file = File::open(&path).expect("open");
+            let mapping = Mapping::new(&file, content.len());
+            assert_eq!(mapping.bytes(), content.as_slice(), "{name} mapped");
+        }
+    }
+    for name in fixture.containers.iter().chain(&fixture.hidden) {
+        assert!(!member(&mountpoint, name).exists(), "{name} is shown");
+    }
+    for dir in &fixture.dirs {
+        assert!(fs::metadata(member(&mountpoint, dir)).expect("dir").is_dir(), "{dir}");
+    }
+    assert_eq!(fixture.content("config.json"), fs::read(mountpoint.join("config.json")).expect("read again"));
+    handle.unmount().expect("unmount");
+    assert!(!mountpoint.exists(), "the mount point directory is left behind");
 }

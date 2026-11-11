@@ -17,18 +17,27 @@ compiler, because `zstd-sys` compiles zstd.
 ```text
 ziptensors encode <INPUT> <OUTPUT> [--mode fast|balanced|max] [--threads N]
 ziptensors pack <OUTPUT> <INPUT>... [--delta-base FILE] [--mode M] [--threads N]
-ziptensors restore <CONTAINER> <OUTPUT> [--max-total-decoded BYTES]
-ziptensors restore <CONTAINER> --all <DIR> [--max-total-decoded BYTES]
-ziptensors extract <CONTAINER> <MEMBER> <OUTPUT> [--max-total-decoded BYTES]
+ziptensors edit <CONTAINER> [--add PATH]... [--add-as NAME PATH]... [--remove NAME]... [--replace NAME PATH]...
+                [--delta-base MEMBER] [-F | -R] [-C] [--mode M]
+ziptensors compact <CONTAINER> [-R] [-C] [--mode M]
+ziptensors recover <CONTAINER> [--dry-run] [--no-verify]
+ziptensors restore <CONTAINER> <OUTPUT>
+ziptensors restore <CONTAINER> --all <DIR>
+ziptensors extract <CONTAINER> <MEMBER> <OUTPUT|->
 ziptensors merge <OUTPUT> <INPUT>...
-ziptensors inspect <CONTAINER> [--json]
+ziptensors inspect <CONTAINER> [--json] [--tensors]
 ziptensors verify <CONTAINER>
-ziptensors mount <CONTAINER> <MOUNTPOINT> [--cache-size BYTES] [--max-total-decoded BYTES]
+ziptensors compress [-r] <PATH>... [-k] [--follow-symlinks] [--dry-run] [--mode M]
+ziptensors decompress [-r] <PATH>... [-k] [-f] [--dry-run]
+ziptensors mount <CONTAINER> <MOUNTPOINT> [--cache-size BYTES]
 ```
 
-`ziptensors <command> --help` lists every option. Pass `--max-total-decoded` when the container comes
-from somewhere else: without it there is no decode budget. The hashes detect damage; they do not
-authenticate a file.
+`edit -F` appends and is safe to interrupt (`recover` restores the previous version); `edit -R` and
+`compact -R` rewrite in place with no extra space, and an interruption damages the container.
+
+`ziptensors <command> --help` lists every option. Every command that opens a container takes
+`--max-total-decoded BYTES`: pass it when the container comes from somewhere else, since without it
+there is no decode budget. The hashes detect damage; they do not authenticate a file.
 
 ## Mounting
 

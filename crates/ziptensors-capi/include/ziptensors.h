@@ -218,6 +218,47 @@
 #define ZT_DTYPE_MXFP4 71
 
 /*
+ `zt_edit_op.kind`: adds the file `path` as the new member `name`, after the kept members.
+ */
+#define ZT_EDIT_ADD 1
+
+/*
+ `zt_edit_op.kind`: removes the member `name`. `path` and `delta_base` must be NULL.
+ */
+#define ZT_EDIT_REMOVE 2
+
+/*
+ `zt_edit_op.kind`: replaces the content of member `name` with the file `path`, in its slot.
+ */
+#define ZT_EDIT_REPLACE 3
+
+/*
+ `zt_member_desc.profile`: no structure was recognized; the member is stored as bytes. The profile
+ ids are literals, as cbindgen does not evaluate core's mapping; a test pins them to `Profile`.
+ */
+#define ZT_PROFILE_OPAQUE 0
+
+/*
+ safetensors.
+ */
+#define ZT_PROFILE_SAFETENSORS 1
+
+/*
+ GGUF.
+ */
+#define ZT_PROFILE_GGUF 2
+
+/*
+ ONNX protobuf.
+ */
+#define ZT_PROFILE_ONNX 3
+
+/*
+ `PyTorch` ZIP archive.
+ */
+#define ZT_PROFILE_PT_ZIP 4
+
+/*
  Result of an entry point. `ZT_STATUS_OK` is 0, positive values name a failure of the library, and
  negative ones a call that was refused at the ABI. Values never change and are never reused. After
  any value but `ZT_STATUS_OK`, `zt_last_error` has the details.
@@ -314,6 +355,35 @@ enum zt_status
    */
   ZT_STATUS_COMMITTED_NOT_DURABLE = 20,
   /*
+   An in-place edit failed after it began moving data: the container is damaged. Restore it from
+   a backup or repack it.
+   */
+  ZT_STATUS_DAMAGED_IN_PLACE = 21,
+  /*
+   An edit request cannot be applied as asked. Raised before anything is written: the container is
+   unchanged.
+   */
+  ZT_STATUS_EDIT_REFUSED = 22,
+  /*
+   The file holds a valid container followed by bytes that could not be removed, so it does not
+   open as it is. Recovery truncates it to the valid length.
+   */
+  ZT_STATUS_TRAILING_BYTES = 23,
+  /*
+   Recovery found no valid container in the file. Nothing was changed.
+   */
+  ZT_STATUS_UNRECOVERABLE = 24,
+  /*
+   A tree operation found names that collide and refused the whole run. Nothing was written.
+   */
+  ZT_STATUS_TREE_CONFLICT = 25,
+  /*
+   A write would store two members under one name, for example a file added to a pack under a
+   name the pack already has. That member was not added. A container whose index holds a name
+   twice is damaged instead, `ZT_STATUS_MALFORMED_INDEX`.
+   */
+  ZT_STATUS_DUPLICATE_MEMBER = 26,
+  /*
    A required pointer was NULL.
    */
   ZT_STATUS_NULL_ARGUMENT = -1,
@@ -332,7 +402,8 @@ enum zt_status
    */
   ZT_STATUS_STRUCT_SIZE = -4,
   /*
-   The handle cannot do this any more: a `zt_pack` that was finished, or that panicked.
+   The call cannot be done in this state: a `zt_pack` that was finished, or that panicked;
+   `zt_enable_stderr_logging` in a process where something else already set the global logger.
    */
   ZT_STATUS_INVALID_STATE = -5,
   /*
@@ -407,6 +478,81 @@ typedef int32_t zt_verify;
 #endif // __cplusplus
 
 /*
+ How `zt_edit` replaces the container, for `zt_edit_options.strategy`.
+ */
+enum zt_strategy
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /*
+   Writes the whole result to a temporary file beside the container, proves it and renames it over
+   the container. Needs room for a second copy; the container is intact after any failure. Drops
+   the dead data of earlier edits. The default.
+   */
+  ZT_STRATEGY_REWRITE = 0,
+  /*
+   Writes only the new data, a new index and a new footer after the end of the container. Needs
+   room only for what is new; the old data stays in the file as dead bytes. A failure cuts the file
+   back to its old length, or returns `ZT_STATUS_TRAILING_BYTES` if that cut fails (see
+   `zt_recover`). Refused with `repack` and with no operation.
+   */
+  ZT_STRATEGY_APPEND = 1,
+  /*
+   RISKY. Rewrites the container inside its own file, with no temporary file and no extra space. A
+   crash, power loss or failed write after the first write leaves a damaged container that may not
+   be recoverable (`ZT_STATUS_DAMAGED_IN_PLACE`): keep a backup or the original inputs. Nothing may
+   read the file meanwhile. Refused with `repack` and with a `delta_base` that is a kept member.
+   */
+  ZT_STRATEGY_IN_PLACE = 2,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum zt_strategy zt_strategy;
+#else
+typedef int32_t zt_strategy;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/*
+ Most verbose level written by `zt_enable_stderr_logging`. The values are those of the `log` and
+ `tracing` conventions: a larger value writes more.
+ */
+enum zt_log_level
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+  : int32_t
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
+ {
+  /*
+   Failures only.
+   */
+  ZT_LOG_LEVEL_ERROR = 1,
+  /*
+   Failures and refused calls: every failing entry point logs one line at this level.
+   */
+  ZT_LOG_LEVEL_WARN = 2,
+  /*
+   Also the stages of long operations: open, encode, commit, edit, recover.
+   */
+  ZT_LOG_LEVEL_INFO = 3,
+  /*
+   Also details of decisions inside operations.
+   */
+  ZT_LOG_LEVEL_DEBUG = 4,
+  /*
+   Everything.
+   */
+  ZT_LOG_LEVEL_TRACE = 5,
+};
+#ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum zt_log_level zt_log_level;
+#else
+typedef int32_t zt_log_level;
+#endif // __STDC_VERSION__ >= 202311L
+#endif // __cplusplus
+
+/*
  An open container. Create with `zt_open`, free with `zt_close`. Every function taking a
  `const zt_container *` may be called from any number of threads at once.
  */
@@ -430,6 +576,113 @@ typedef struct zt_member zt_member;
 typedef struct zt_pack zt_pack;
 
 /*
+ One change of `zt_edit`. A zeroed struct is refused: 0 is no kind. Strings are read during the call
+ only.
+ */
+typedef struct zt_edit_op {
+  /*
+   `ZT_EDIT_ADD`, `ZT_EDIT_REMOVE` or `ZT_EDIT_REPLACE`. Any other value is refused with
+   `ZT_STATUS_INVALID_ARGUMENT`.
+   */
+  int32_t kind;
+  /*
+   The member, UTF-8, `/` separated. For an add, a new name a restore accepts.
+   */
+  const char *name;
+  /*
+   The input file, for an add or a replace; NULL for a remove. It must be a regular file, not a
+   symbolic link, and not the container.
+   */
+  const char *path;
+  /*
+   NULL, or for an add or a replace a member of the result to store the file against as delta
+   blobs where that is smaller: a kept member, or a file added or replaced earlier in this array.
+   NULL for a remove.
+   */
+  const char *delta_base;
+} zt_edit_op;
+
+/*
+ Options of `zt_edit`. Set `struct_size` to `sizeof(zt_edit_options)`. A field left 0 takes its
+ default: `ZT_STRATEGY_REWRITE`, no repack, `ZT_MODE_MAX` for new files, one thread per CPU, no
+ decode budget.
+
+ NOTE on `max_total_decoded`: 0 means NO budget, unlike the Rust, Python and command line
+ interfaces, where 0 is a budget of zero bytes.
+ */
+typedef struct zt_edit_options {
+  /*
+   `sizeof(zt_edit_options)` of the header the caller was built with.
+   */
+  size_t struct_size;
+  /*
+   One of `zt_strategy`.
+   */
+  int32_t strategy;
+  /*
+   1 re-encodes every kept member with `mode`, deduplication and delta pairing redone over the
+   whole result; 0 copies kept members as they are stored. Only with `ZT_STRATEGY_REWRITE`: the
+   other strategies return `ZT_STATUS_EDIT_REFUSED`. Other values are refused.
+   */
+  int32_t repack;
+  /*
+   One of `zt_mode`: the mode of new files, and of every member under `repack`.
+   `ZT_MODE_DEFAULT` means `ZT_MODE_MAX`.
+   */
+  int32_t mode;
+  /*
+   Compression, verification and decode threads. 0 means one per logical CPU.
+   */
+  size_t threads;
+  /*
+   Budget on the sum of member lengths of the container being edited, in bytes; a container over
+   it is refused before anything is written. 0 means NO budget (see the note above).
+   */
+  uint64_t max_total_decoded;
+} zt_edit_options;
+
+/*
+ Options of `zt_recover`. Set `struct_size` to `sizeof(zt_recover_options)`. A field left 0 takes
+ its default: write the cut, verify the generation found, at most 64 candidates, no bound on the
+ bytes scanned, no decode budget.
+
+ NOTE on `max_total_decoded`: 0 means NO budget, unlike the Rust, Python and command line
+ interfaces, where 0 is a budget of zero bytes.
+ */
+typedef struct zt_recover_options {
+  /*
+   `sizeof(zt_recover_options)` of the header the caller was built with.
+   */
+  size_t struct_size;
+  /*
+   1 reports what would be done and writes nothing, opening the file read only; 0 cuts the file.
+   Other values are refused.
+   */
+  int32_t dry_run;
+  /*
+   0, the default, decodes every member of the generation found and checks its BLAKE3 before
+   anything is cut, and passes over a generation that fails. 1 skips that and takes the latest
+   generation that passes the structural checks: only for a file known never to have been edited
+   in place. Other values are refused.
+   */
+  int32_t skip_verify;
+  /*
+   Most candidate footers given a full check. 0 means 64.
+   */
+  uint32_t max_candidates;
+  /*
+   Most distinct bytes the backward scan reads; the overlap of its blocks counts once. 0 means no
+   bound.
+   */
+  uint64_t max_scan_bytes;
+  /*
+   Budget on the sum of member lengths of each candidate, in bytes. 0 means NO budget (see the note
+   above).
+   */
+  uint64_t max_total_decoded;
+} zt_recover_options;
+
+/*
  Options of `zt_open`. Set `struct_size` to `sizeof(zt_open_options)`. A field left 0 takes its
  default.
  */
@@ -448,8 +701,9 @@ typedef struct zt_open_options {
    */
   uint64_t max_index_bytes;
   /*
-   Budget on the sum of member lengths in bytes; a container over it is refused at open. 0 means no
-   budget.
+   Budget on the sum of member lengths in bytes; a container over it is refused at open.
+   NOTE: 0 means NO budget here, unlike the Rust, Python and command line interfaces, where 0 is a
+   budget of zero bytes. Set it for untrusted input.
    */
   uint64_t max_total_decoded;
   /*
@@ -502,6 +756,34 @@ typedef struct zt_tensor_desc {
 } zt_tensor_desc;
 
 /*
+ What a container states about one member, filled in by `zt_member_info`. Set `struct_size` to
+ `sizeof(zt_member_desc)` before the call; the library checks it and writes the whole struct.
+ */
+typedef struct zt_member_desc {
+  /*
+   `sizeof(zt_member_desc)` of the header the caller was built with. Set by the caller.
+   */
+  size_t struct_size;
+  /*
+   Length of the member in bytes.
+   */
+  uint64_t len;
+  /*
+   BLAKE3 of the whole content, as the file states it. `zt_member_verify` checks it.
+   */
+  uint8_t blake3[32];
+  /*
+   The source format the writer recognized, one of `ZT_PROFILE_*`. A hint: ids unknown to the
+   caller are legal.
+   */
+  uint8_t profile;
+  /*
+   Number of tensors in the member's table.
+   */
+  uint32_t tensor_count;
+} zt_member_desc;
+
+/*
  Options of `zt_encode_file` and `zt_pack_new`. Set `struct_size` to `sizeof(zt_encode_options)`. A
  field left 0 takes its default.
  */
@@ -546,6 +828,77 @@ uint32_t zt_abi_version(void);
  */
 size_t zt_last_error(char *buf,
                      size_t cap);
+
+/*
+ Edits the container at `container` by the `count` operations at `ops`, a set: each member name
+ appears in at most one operation. Kept members keep their order, a replace keeps its member's slot,
+ and adds follow in array order. `count == 0` (with `ops` NULL or not) compacts the container: it is
+ rewritten without the dead data of earlier edits. A NULL `options` means defaults: a rewrite
+ through a temporary file with `ZT_MODE_MAX` for new files. The result is proven before it replaces
+ the container.
+
+ Every check runs before a byte is written, so after these statuses the file is untouched:
+ `ZT_STATUS_INVALID_ARGUMENT` for an unknown `kind` or a field the kind does not take,
+ `ZT_STATUS_NULL_ARGUMENT` and `ZT_STATUS_INVALID_UTF8` for strings (the error text names the
+ operation's index), `ZT_STATUS_EDIT_REFUSED` for a set or a combination that cannot be applied (a
+ name in two operations, an add of an existing name, `repack` without `ZT_STRATEGY_REWRITE`, an
+ append with no operation, ...), `ZT_STATUS_MEMBER_NOT_FOUND`, `ZT_STATUS_UNSAFE_MEMBER_NAME`,
+ `ZT_STATUS_OUTPUT_IS_INPUT`, `ZT_STATUS_SYMLINK_INPUT`, and the statuses of `zt_open`.
+
+ Later failures depend on the strategy: a rewrite leaves the container intact; an append cuts it
+ back, or returns `ZT_STATUS_TRAILING_BYTES` if it cannot (`zt_recover` repairs that); an in-place
+ rewrite returns `ZT_STATUS_DAMAGED_IN_PLACE`: the container is damaged. Close every `zt_container`
+ open on the file before a rewrite or an in-place edit.
+
+ # Safety
+ `container` must be NULL or NUL-terminated. Unless `count` is 0, `ops` must be NULL or point at
+ `count` valid `zt_edit_op`, whose strings are NULL or NUL-terminated. `options` must be NULL or a
+ valid `zt_edit_options` whose `struct_size` is set. Everything is only read during the call.
+ */
+zt_status zt_edit(const char *container,
+                  const struct zt_edit_op *ops,
+                  size_t count,
+                  const struct zt_edit_options *options);
+
+/*
+ Shortens the file at `container` to its latest valid generation, when its end does not close a
+ valid container: after an append that was cut off, or after `ZT_STATUS_TRAILING_BYTES`. Never done
+ on its own: no reader recovers. A NULL `options` means defaults. On success, unless `valid_len_out`
+ is NULL, `*valid_len_out` is the length of the valid container: the file's length if it opened as it
+ was (then nothing is changed) or the length it was cut to (or would be, on a dry run). It is
+ untouched on failure.
+
+ By default every member of the generation found is decoded and checked before anything is cut,
+ and a generation that fails is passed over for an older one. Nothing below the valid length is
+ ever written.
+
+ Returns `ZT_STATUS_UNRECOVERABLE` if no valid generation was found within the budget,
+ `ZT_STATUS_NOT_ZIPTENSORS` if the file does not start as a container, a verification status such
+ as `ZT_STATUS_VERIFY_FAILED` if no structurally valid generation verifies, `ZT_STATUS_BUDGET_EXCEEDED`
+ if a candidate is over the limits, and `ZT_STATUS_IO`. Every failure leaves the file unchanged,
+ except `ZT_STATUS_IO` from the sync after the cut: then the file is cut, but the cut may not survive
+ a power loss.
+
+ # Safety
+ `container` must be NULL or NUL-terminated, and is only read during the call. `options` must be NULL
+ or a valid `zt_recover_options` whose `struct_size` is set. `valid_len_out` must be NULL or valid for
+ a write, and is not read.
+ */
+zt_status zt_recover(const char *container,
+                     const struct zt_recover_options *options,
+                     uint64_t *valid_len_out);
+
+/*
+ Writes the library's log lines up to `level`, one of `zt_log_level`, to stderr, for the rest of the
+ process. Off until called. Only the first valid call installs anything: later calls change nothing,
+ a different `level` included, and return what the first one returned.
+
+ Returns `ZT_STATUS_INVALID_ARGUMENT` for a value that is no `zt_log_level`, and
+ `ZT_STATUS_INVALID_STATE` if the process already has a global `tracing` subscriber that this
+ library did not install: the library's lines then go to that one, if anywhere. A `log` logger of
+ the host does not matter, since the library logs through `tracing` only.
+ */
+zt_status zt_enable_stderr_logging(int level);
 
 /*
  Opens the container at `path`, recognized by its magic and not by its name. On success `*out` is
@@ -700,6 +1053,50 @@ zt_status zt_tensor_info(const struct zt_member *member, size_t index, struct zt
 zt_status zt_restore_file(const struct zt_member *member, const char *path);
 
 /*
+ Fills `*out` with what the container states about member `index`, in file order. The caller sets
+ `out->struct_size` to `sizeof(zt_member_desc)` first; on any failure `*out` is untouched. Nothing
+ is decoded: the hash and the lengths are what the index says.
+
+ Returns `ZT_STATUS_STRUCT_SIZE` if `out->struct_size` is not the size this library knows, and
+ `ZT_STATUS_INVALID_ARGUMENT` if `index` is not below `zt_member_count`.
+
+ # Safety
+ `container` must be NULL or a live handle. `out` must be NULL or valid for reads of its first field
+ and for a write of a whole `zt_member_desc`.
+ */
+zt_status zt_member_info(const struct zt_container *container,
+                         size_t index,
+                         struct zt_member_desc *out);
+
+/*
+ Decodes the whole member and compares its BLAKE3 with the hash the container states. Writes
+ nothing. Returns `ZT_STATUS_VERIFY_FAILED` if the hash differs, or the status of the decoding
+ failure, `ZT_STATUS_CHECKSUM_MISMATCH` or `ZT_STATUS_CHUNK_CORRUPT` for example.
+
+ # Safety
+ `member` must be NULL or a live handle.
+ */
+zt_status zt_member_verify(const struct zt_member *member);
+
+/*
+ Restores every member to `dir` joined with its name, in file order, each as `zt_restore_file`
+ does, creating `dir` and the directories the names need. On success, unless `bytes_out` is NULL,
+ `*bytes_out` is the number of bytes written over all members; it is untouched on failure.
+
+ Every name is checked before anything is created: with one name a restore must refuse (`..`, an
+ absolute path, a drive letter), the call returns `ZT_STATUS_UNSAFE_MEMBER_NAME` and creates
+ nothing, not even `dir`. After that, a failure stops the run and keeps the members restored before
+ it; the failed member leaves no file.
+
+ # Safety
+ `container` must be NULL or a live handle. `dir` must be NULL or NUL-terminated, and is only read
+ during the call. `bytes_out` must be NULL or valid for a write, and is not read.
+ */
+zt_status zt_restore_all(const struct zt_container *container,
+                         const char *dir,
+                         uint64_t *bytes_out);
+
+/*
  Encodes the file at `input` as a container of one member, named after the file, at `output`. A
  `NULL` `options` means defaults: `ZT_MODE_BALANCED`, one thread per CPU. The whole output is decoded
  and hashed against the input before it appears. On failure nothing is left at `output`, except
@@ -737,7 +1134,7 @@ zt_status zt_pack_new(const char *output,
  call on the pack fails too.
 
  Returns `ZT_STATUS_UNSAFE_MEMBER_NAME` if a restore would refuse `member`,
- `ZT_STATUS_MALFORMED_INDEX` if the pack has a member of this name, `ZT_STATUS_SYMLINK_INPUT`,
+ `ZT_STATUS_DUPLICATE_MEMBER` if the pack has a member of this name, `ZT_STATUS_SYMLINK_INPUT`,
  `ZT_STATUS_IO` and `ZT_STATUS_INPUT_CHANGED` as `zt_encode_file`, and `ZT_STATUS_INVALID_STATE` after
  `zt_pack_finish`.
 
@@ -748,6 +1145,46 @@ zt_status zt_pack_new(const char *output,
 zt_status zt_pack_add_file(struct zt_pack *pack,
                            const char *path,
                            const char *member);
+
+/*
+ Adds the file at `path` as the member `member`, as `zt_pack_add_file` does, and stores its tensors
+ that pair with tensors of `base_member` as delta blobs where that is smaller. A tensor pairs with a
+ base tensor of the same name (or the same name without a publication prefix), length and dtype.
+ Only `ZT_MODE_MAX` stores delta blobs; under the other modes this is `zt_pack_add_file` after the
+ check of `base_member`. A reader needs a library with delta support (format feature bit 0).
+
+ `base_member` must be a member this pack added from a file, and that file must still be as it was:
+ it is read again. Returns `ZT_STATUS_MEMBER_NOT_FOUND` if the pack added no such member from a file,
+ `ZT_STATUS_INPUT_CHANGED` if the base file changed, and every status of `zt_pack_add_file`. On
+ failure the pack is as `zt_pack_add_file` leaves it.
+
+ # Safety
+ `pack` must be NULL or a live handle no other thread is using. `path`, `member` and `base_member`
+ must be NULL or NUL-terminated, and are only read during the call.
+ */
+zt_status zt_pack_add_file_delta(struct zt_pack *pack,
+                                 const char *path,
+                                 const char *member,
+                                 const char *base_member);
+
+/*
+ Copies the member `member` of the open container `source` into the pack under the same name, with
+ no decoding and no recompression. Its bytes are proven against the hash `source` states when the
+ pack is finished. `source` must stay open until this call returns; the pack keeps what it needs.
+
+ Returns `ZT_STATUS_MEMBER_NOT_FOUND` if `source` has no such member,
+ `ZT_STATUS_UNSAFE_MEMBER_NAME` if a restore would refuse the name, `ZT_STATUS_DUPLICATE_MEMBER` if
+ the pack has a member of this name, `ZT_STATUS_IO` if a read or a write fails, and
+ `ZT_STATUS_INVALID_STATE` after `zt_pack_finish`. On failure the pack is as `zt_pack_add_file`
+ leaves it.
+
+ # Safety
+ `pack` must be NULL or a live handle no other thread is using. `source` must be NULL or a live
+ container handle. `member` must be NULL or NUL-terminated, and is only read during the call.
+ */
+zt_status zt_pack_add_member_from(struct zt_pack *pack,
+                                  const struct zt_container *source,
+                                  const char *member);
 
 /*
  Commits the container: decodes it all and hashes it against the inputs, syncs it, and renames it to

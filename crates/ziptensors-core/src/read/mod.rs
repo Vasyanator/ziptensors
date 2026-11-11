@@ -5,8 +5,8 @@
 //! Main responsibilities: the module list and the public surface of the reader.
 //!
 //! Key structures: [`Container`], [`OpenOptions`], [`MemberInfo`], [`Member`], [`ReadRequest`],
-//! [`RestoreReport`], and the opt-in [`ReadCache`] with [`CachedMember`], [`CacheOptions`],
-//! [`CacheStats`].
+//! [`RestoreReport`], [`RestoreAllReport`], and the opt-in [`ReadCache`] with [`CachedMember`],
+//! [`CacheOptions`], [`CacheStats`].
 
 mod batch;
 mod cache;
@@ -24,4 +24,4 @@ mod tests;
 pub use cache::{CacheOptions, CacheStats, CachedMember, ReadCache};
 pub use container::{Container, MemberInfo, OpenOptions};
 pub use member::{Member, ReadRequest};
-pub use restore::RestoreReport;
+pub use restore::{RestoreAllReport, RestoreReport};

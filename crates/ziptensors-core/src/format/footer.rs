@@ -21,7 +21,7 @@ use crate::error::Error;
 pub const FOOTER_LEN: u64 = 64;
 /// Trailing magic: `ZTS-END` and one zero byte.
 pub const END_MAGIC: [u8; 8] = *b"ZTS-END\0";
-/// The `generation` of a file written by this version.
+/// The `generation` of a freshly written file. An edit writes the previous footer's value plus one.
 pub const GENERATION_INITIAL: u64 = 1;
 
 /// A file footer. A successful [`parse_footer`] implies hash, `end_magic` and reserved bytes hold;
@@ -41,17 +41,23 @@ pub struct Footer {
 }
 
 impl Footer {
-    /// The footer of a new file, for a decompressed index `raw_index` stored at `index_offset` in
-    /// `index_stored_len` bytes.
+    /// The footer for a decompressed index `raw_index` stored at `index_offset` in
+    /// `index_stored_len` bytes. `generation` is [`GENERATION_INITIAL`] for a fresh file and the
+    /// previous footer's value plus one for an edit; no value is invalid.
     #[must_use]
-    pub fn for_index(index_offset: u64, index_stored_len: u64, raw_index: &[u8]) -> Self {
+    pub fn for_index(
+        index_offset: u64,
+        index_stored_len: u64,
+        raw_index: &[u8],
+        generation: u64,
+    ) -> Self {
         Self {
             index_offset,
             index_stored_len,
             // Lossless: `usize` is at most 64 bits on every supported target.
             index_raw_len: raw_index.len() as u64,
             index_xxh3: xxh3_64(raw_index),
-            generation: GENERATION_INITIAL,
+            generation,
         }
     }
 
@@ -167,7 +173,7 @@ pub fn parse_footer(bytes: &[u8; 64]) -> Result<Footer, Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Footer, parse_footer};
+    use super::{Footer, GENERATION_INITIAL, parse_footer};
     use crate::error::Error;
     use crate::format::Limits;
     use crate::format::limits::MAX_INDEX_RAW_LEN;
@@ -322,7 +328,7 @@ mod tests {
     #[test]
     fn index_bytes_must_match_length_and_hash() {
         let raw = b"abc";
-        let footer = Footer::for_index(64, 10, raw);
+        let footer = Footer::for_index(64, 10, raw, GENERATION_INITIAL);
         assert_eq!(footer.index_raw_len, 3);
         // Reference value computed with `twox-hash`.
         assert_eq!(footer.index_xxh3, 0x78AF_5F94_892F_3950);
@@ -331,5 +337,15 @@ mod tests {
         assert!(is_malformed(&footer.check_index(b"abd").expect_err("hash"), "index"));
         assert!(is_malformed(&footer.check_index(b"abcd").expect_err("length"), "index"));
         assert!(is_malformed(&footer.check_index(b"").expect_err("length"), "index"));
+    }
+
+    #[test]
+    fn the_generation_of_a_new_footer_round_trips() {
+        for generation in [GENERATION_INITIAL, 2, u64::MAX] {
+            let footer = Footer::for_index(0x1000, 0x200, b"abc", generation);
+            assert_eq!(footer.generation, generation);
+            let parsed = parse_footer(&footer.to_bytes()).expect("valid");
+            assert_eq!(parsed, footer);
+        }
     }
 }

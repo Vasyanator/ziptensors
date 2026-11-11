@@ -1,14 +1,18 @@
 //! File: report.rs
-//! Purpose: what an encode, a pack and a restore return to Python.
+//! Purpose: what an encode, a pack, a restore, an edit, a recovery and an input walk return to
+//! Python.
 //!
 //! Main responsibilities: read-only classes mirroring the report types of `ziptensors-core`, with
 //! their conversions. Sums and meanings stay in the core.
 //!
 //! Key structures: [`LayerBytes`], [`ClassBytes`], [`MemberReport`], [`VerifyReport`],
-//! [`EncodeReport`], [`RestoreReport`].
+//! [`EncodeReport`], [`RestoreReport`], [`RestoreAllReport`], [`EditReport`], [`RecoverReport`],
+//! [`Inputs`]. The tree reports live in `tree.rs`, beside the only calls that make them.
 //!
 //! Implementation notes: fields use the core's names. Times are seconds, as `float`. Dtypes and
 //! profiles are names, by `names.rs`. `Clone` exists only because a getter hands out a copy.
+
+use std::path::PathBuf;
 
 use pyo3::prelude::*;
 use ziptensors_core as zt;
@@ -132,7 +136,7 @@ impl From<zt::VerifyReport> for VerifyReport {
 
 /// What a finished container holds and what it cost.
 #[pyclass(frozen, get_all, module = "ziptensors")]
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct EncodeReport {
     /// Length of the output file in bytes.
     output_len: u64,
@@ -174,5 +178,116 @@ pub(crate) struct RestoreReport {
 impl From<zt::RestoreReport> for RestoreReport {
     fn from(report: zt::RestoreReport) -> Self {
         Self { bytes: report.bytes, blake3: report.blake3 }
+    }
+}
+
+/// What `Container.restore_all` produced.
+#[pyclass(frozen, get_all, module = "ziptensors")]
+#[derive(Debug)]
+pub(crate) struct RestoreAllReport {
+    /// Members restored: all members of the container.
+    members: usize,
+    /// Bytes written over all of them.
+    bytes: u64,
+}
+
+impl From<zt::RestoreAllReport> for RestoreAllReport {
+    fn from(report: zt::RestoreAllReport) -> Self {
+        Self { members: report.members, bytes: report.bytes }
+    }
+}
+
+/// What an edit or a compaction did.
+#[pyclass(frozen, get_all, module = "ziptensors")]
+#[derive(Debug)]
+pub(crate) struct EditReport {
+    /// Members of the source in the result as they were.
+    kept: u32,
+    /// Files added at the end.
+    added: u32,
+    /// Members removed.
+    removed: u32,
+    /// Members replaced in their slot.
+    replaced: u32,
+    /// The footer `generation` of the result: the source's plus one.
+    generation: u64,
+    /// The writer's report on the result. Under `append` its `output_len` is the whole file,
+    /// earlier generations included.
+    encode: EncodeReport,
+    /// Bytes of the source that no member of the source needed: what a rewrite with no operation
+    /// would drop.
+    dead_bytes_before: u64,
+}
+
+impl From<zt::EditReport> for EditReport {
+    fn from(report: zt::EditReport) -> Self {
+        Self {
+            kept: report.kept,
+            added: report.added,
+            removed: report.removed,
+            replaced: report.replaced,
+            generation: report.generation,
+            encode: report.encode.into(),
+            dead_bytes_before: report.dead_bytes_before,
+        }
+    }
+}
+
+/// What `recover` found and did.
+#[pyclass(frozen, get_all, module = "ziptensors")]
+#[derive(Debug)]
+pub(crate) struct RecoverReport {
+    /// Length of the file before recovery.
+    file_len: u64,
+    /// Length of the valid container: `file_len` when the file opened as it was.
+    valid_len: u64,
+    /// The `generation` of the container ending at `valid_len`.
+    generation: u64,
+    /// Whether the file was cut to `valid_len`. False when nothing needed cutting, and on a dry run.
+    truncated: bool,
+    /// Sum of the member lengths decoded and checked, or None when nothing was verified.
+    verified_bytes: Option<u64>,
+    /// Distinct bytes the backward scan read, at most `file_len - 64`; 0 when the file opened as
+    /// it was.
+    scanned_bytes: u64,
+    /// Newer candidate generations (footers whose hash holds) that failed the structural checks or
+    /// verification and were passed over; 0 when the file opened as it was or only a torn tail was
+    /// cut.
+    passed_over: u64,
+}
+
+impl From<zt::RecoverReport> for RecoverReport {
+    fn from(report: zt::RecoverReport) -> Self {
+        Self {
+            file_len: report.file_len,
+            valid_len: report.valid_len,
+            generation: report.generation,
+            truncated: report.truncated,
+            verified_bytes: report.verified_bytes,
+            scanned_bytes: report.scanned_bytes,
+            passed_over: report.passed_over,
+        }
+    }
+}
+
+/// What the walk of `collect_inputs`, the one `pack` does over directories, found.
+#[pyclass(frozen, get_all, module = "ziptensors")]
+#[derive(Debug)]
+pub(crate) struct Inputs {
+    /// Files to add as `(path, member name)`, per root in the order given, then by member name.
+    files: Vec<(PathBuf, String)>,
+    /// Symbolic links left out; links are neither followed nor stored.
+    skipped_symlinks: u64,
+    /// `*.incomplete` files left out: partial downloads.
+    skipped_incomplete: u64,
+}
+
+impl From<zt::Inputs> for Inputs {
+    fn from(inputs: zt::Inputs) -> Self {
+        Self {
+            files: inputs.files,
+            skipped_symlinks: inputs.skipped_symlinks,
+            skipped_incomplete: inputs.skipped_incomplete,
+        }
     }
 }

@@ -14,7 +14,9 @@ read_at           Segments (member range -> one segment per extent)
                   -> Planner (segment -> chunks, lazily) -> Batch (bounded, coalesced)
                   -> read_exact_at on the calling thread -> decode on the private pool -> repeat
 read_many         the same, with segments collected and sorted by file offset first
-restore, verify   read_at in runs of one batch, streamed through BLAKE3
+restore, verify,  read_at in runs of one batch (hash_stream), streamed through BLAKE3
+decode_to           -> temporary file and commit / nothing / the caller's writer
+restore_all       every name checked -> directories -> restore_file per member, in file order
 ReadCache         CachedMember::read_at -> Member::chunk_window per window -> hit, or wait for a fill in
                   flight, or reserve a run of absent windows -> one read_many with no lock held -> publish
 ```
@@ -41,7 +43,7 @@ and its delta chunks as another.
 | `batch.rs` | `Engine`, segments, planning, coalescing, decode jobs with their delta base chunks, widening of partial runs. |
 | `scratch.rs` | `Scratch` (workspace, canonical chunk, base chunk), the bounded pool and its RAII `Lease`. |
 | `cache.rs` | `ReadCache`, `CachedMember`, `CacheOptions`, `CacheStats`: the opt-in decoded-window cache. |
-| `restore.rs` | `restore_file`, `verify`, `RestoreReport`. The commit itself is `io::TempFile`. |
+| `restore.rs` | `restore_file`, `decode_to`, `verify`, `Container::restore_all`, `RestoreReport`, `RestoreAllReport`, and their tests. The commit itself is `io::TempFile`. |
 | `testkit.rs` | Test only. `ContainerBuilder`, `MemorySource`, seeded data. Also included by `tests/read_memory.rs`. |
 | `cache_tests.rs` | Tests of the cache against `Member::read_at`. |
 | `tests.rs` | Reader tests. The peak memory test is `tests/read_memory.rs`, which needs its own allocator. |
@@ -80,7 +82,7 @@ and its delta chunks as another.
 - An open `Container` also holds its index: the decoded records, the member list and the tensor table with
   copies of names and shapes, about twice `index_raw_len`. It is fixed at open and does not grow with
   reads. Concurrent calls each hold their own batch and share the scratch entries.
-  `read_many` adds one small record per extent touched. `restore_file` and `verify` add their stream
+  `read_many` adds one small record per extent touched. `restore_file`, `decode_to` and `verify` add their stream
   buffer, one batch long and at least two chunks, which is the destination of their reads. zstd's own contexts allocate in C:
   about 100 KiB per scratch entry, constant.
 - `stored` and `dst` are disjoint by construction: stored bytes live in a buffer the call owns.
@@ -127,7 +129,14 @@ and its delta chunks as another.
 - Restore uses extents and the member hash only, never tensor ranges. A failed restore leaves no new file at
   the output and removes its temporary file. Reading writes nothing.
 - `restore_file` writes to the path it is given and consults no member name. A caller that derives a path
-  from a member name checks it with `format::check_restore_name` first.
+  from a member name checks it with `format::check_restore_name` first. `Container::restore_all` is the one
+  place in the library that does so: it checks every name before it creates anything, so a hostile name
+  leaves no trace, then restores member by member; a later failure keeps the members before it. Frontends
+  call it rather than repeat the rule.
+- `decode_to` is the one read that hands out unverified bytes: each run reaches the caller's writer once
+  its chunks passed their own hashes, before the member's BLAKE3 is known, and a mismatch is
+  `VerifyFailed` after the last write and a flush. On any `Err` the caller discards what it received. A
+  writer failure is `Io` with op `"write"` or `"flush"` and the member name as its path.
 
 ## Editing map
 
@@ -135,7 +144,7 @@ and its delta chunks as another.
 - Which base chunk serves a delta chunk: `format::DeltaParams::base_chunk`, used by `BlobView::base_of` in
   `batch.rs` and by `format::validate`; never computed anywhere else.
 - What is checked at open: `container.rs`.
-- Restore semantics: `restore.rs` and spec sections 9 and 2.
+- Restore semantics, `decode_to`, `restore_all`: `restore.rs` and spec sections 9 and 2.
 - A change to the memory bound: `tests/read_memory.rs` asserts it.
 - Window geometry (what one cached entry covers): `Member::chunk_window` in `member.rs`. Cache policy,
   read-ahead, eviction, waiting: `cache.rs`.

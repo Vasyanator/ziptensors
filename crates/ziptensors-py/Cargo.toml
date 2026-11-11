@@ -23,3 +23,11 @@ doctest = false
 [dependencies]
 ziptensors-core.workspace = true
 pyo3.workspace = true
+tracing.workspace = true
+# Only for `enable_stderr_logging`, the opt-in stderr subscriber; this crate installs nothing by itself.
+tracing-subscriber.workspace = true
+
+# The mount backends exist on Linux (FUSE) and Windows (WinFsp) only; on macOS `mount` and
+# `mount_overlay` raise `MountError` without this crate.
+[target.'cfg(any(target_os = "linux", windows))'.dependencies]
+ziptensors-mount.workspace = true

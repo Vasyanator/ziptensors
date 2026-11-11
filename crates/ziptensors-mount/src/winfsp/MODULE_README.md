@@ -32,7 +32,7 @@ run_until_signal: console handler -> UnmountSignals channel (1 s timeout = Tick 
 
 | Path | Role |
 |---|---|
-| `mod.rs` | Public API: `mount`, `probe`, `MountHandle`, `run_until_signal`, `WinFspOptions`; lifecycle and teardown order (`Live`, `FileSystemGuard`). |
+| `mod.rs` | Public API: `mount`, `probe`, `MountHandle` (`unmount`, `wait`, under the crate's `handle.rs` contract), `run_until_signal`, `WinFspOptions`; lifecycle and teardown order (`Live`, `FileSystemGuard`). |
 | `abi.rs` | The WinFsp ABI subset: `repr(C)` structures, flag bits, the 64-slot `Interface`, export types, compile-time layout asserts. Declarations only. |
 | `dll.rs` | Registry lookup, `LoadLibraryExW` by full path, typed exports (`Api`), unload on drop. |
 | `callbacks.rs` | The `extern "C"` operations and the static `INTERFACE`; panic guard; refusing stubs. |
@@ -40,7 +40,7 @@ run_until_signal: console handler -> UnmountSignals channel (1 s timeout = Tick 
 | `poke.rs` | Reopens and closes files still counted open, through the volume's device path, so a deferred Close arrives once a mapping is gone. |
 | `names.rs` | Pure rules: path resolution, `NTSTATUS` mapping, `FILETIME`, write rights, listing resume, volume parameters, `MountPoint` parsing, `MAX_PATH` check. Unit-tested without WinFsp. |
 | `security.rs` | The one security descriptor of every node, and its size protocol. |
-| `console.rs` | Console control handler, `UnmountSignals`, `ConsoleEvent`, `MountEnd`, the foreground state machine `step`. |
+| `console.rs` | Console control handler, `UnmountSignals`, `ConsoleEvent` (and its C runtime signal number), the foreground state machine `step`. |
 | `error.rs` | `WinFspError`. |
 
 `../../tests/winfsp.rs` mounts a real container on a new directory and a free drive letter, compares
@@ -112,8 +112,11 @@ without WinFsp, as unit tests of `mod.rs`, also under wine (which defines `C:` a
   the volume leaked, and the caller exits with 130 (Ctrl-C) or 149 (Ctrl-Break). A volume the driver
   stops on its own (a dispatcher thread that failed, such as one that could not be created, or WinFsp
   uninstalled) ends with `Stopped { status }`, the dispatcher's `NTSTATUS`, exit code 1: a failure,
-  never reported as an unmount. Closing the console, logoff and shutdown use the default handler: the process ends, its
-  volume handle closes and WinFsp removes the drive letter or the junction.
+  never reported as an unmount. `MountHandle::unmount` reports that stop as `MountError::Stopped`, and
+  `MountHandle::wait`, which listens on the volume's wake-up channel for the duration, returns
+  `MountEnd::Stopped` (nothing outside the process unmounts a WinFsp volume). Closing the console,
+  logoff and shutdown use the default handler: the process ends, its volume handle closes and WinFsp
+  removes the drive letter or the junction.
 
 ## Editing map
 

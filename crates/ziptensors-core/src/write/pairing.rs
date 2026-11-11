@@ -3,13 +3,16 @@
 //! blob, spec sections 7a and 11.
 //!
 //! Main responsibilities:
-//! - map the tensors of a base member onto its extents, giving each the blob range that holds it;
+//! - map the tensors of a base member onto its extents, giving each the blob range that holds it,
+//!   whether the member comes from a scanned file ([`BaseCatalog::from_plan`]) or from the records
+//!   of a container ([`BaseCatalog::from_member`]);
 //! - pair a tensor of the new file with one of those by name, length and dtype;
 //! - hand the ingest one optional [`BaseRange`] per typed range of the new file.
 //!
 //! Key structures: [`BaseCatalog`], [`BaseTensor`], [`BaseRange`].
 //!
-//! Key functions: [`BaseCatalog::new`], [`BaseCatalog::bases_of`], [`normalize_name`].
+//! Key functions: [`BaseCatalog::from_plan`], [`BaseCatalog::from_member`], [`BaseCatalog::bases_of`],
+//! [`normalize_name`].
 //!
 //! Implementation notes: everything here is a hint. A wrong pair costs only the trial, since the delta
 //! is chosen only where a sample stores smaller, and every member is decoded against its source hash
@@ -22,7 +25,8 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use crate::chain::View;
-use crate::format::ExtentRecord;
+use crate::error::Error;
+use crate::format::{ExtentRecord, Index, MemberRecord};
 use crate::types::{Dtype, RangePlan, TensorInfo};
 
 /// Prefixes that the same weights carry in one publication and not in another. At most one is
@@ -55,9 +59,21 @@ pub(super) struct BaseTensor {
     pub(super) available: u64,
 }
 
-/// The tensors of one base member, by name and by normalized name.
-#[derive(Debug, Default)]
-pub(super) struct BaseCatalog {
+/// One tensor of a base member, as much of it as pairing needs, from a scan or from `TENS`.
+#[derive(Debug, Clone, Copy)]
+struct TensorRef<'a> {
+    name: &'a str,
+    /// Start in the member.
+    offset: u64,
+    /// Length in bytes.
+    len: u64,
+    dtype: Dtype,
+}
+
+/// The tensors of one base member, by name and by normalized name. Two catalogs are equal when they
+/// pair every tensor alike.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct BaseCatalog {
     tensors: Vec<BaseTensor>,
     by_name: HashMap<String, usize>,
     /// `None` where two tensors normalize to the same name: such a name pairs with nothing.
@@ -65,11 +81,54 @@ pub(super) struct BaseCatalog {
 }
 
 impl BaseCatalog {
-    /// Maps the tensors of a base file onto `extents`, the base member's extents in member order,
-    /// which partition the member. A tensor that does not start inside an identity extent is left
-    /// out, since its file bytes are not the canonical bytes of one blob range.
+    /// Maps the tensors of `plan`, the scan of a base file, onto `extents`, the base member's extents
+    /// in member order with blob ids of this pack, which partition the member. A tensor that does not
+    /// start inside an identity extent is left out, since its file bytes are not the canonical bytes
+    /// of one blob range.
     #[must_use]
-    pub(super) fn new(tensors: &[TensorInfo], extents: &[ExtentRecord]) -> Self {
+    pub(super) fn from_plan(plan: &RangePlan, extents: &[ExtentRecord]) -> Self {
+        let tensors = plan.tensors.iter().map(|tensor| TensorRef {
+            name: &tensor.name,
+            offset: tensor.offset,
+            len: tensor.len,
+            dtype: tensor.dtype,
+        });
+        Self::from_tensors(tensors, extents)
+    }
+
+    /// The catalog of `member` of a container, from its records: tensors from `TENS`, extents from
+    /// `EXTN`. For a member this writer added from a file it equals [`BaseCatalog::from_plan`] of that
+    /// file's scan, since the tensor table and the extents are stored as they were.
+    ///
+    /// `index` must be validated, as [`crate::read::Container`] does at open, so that the member's
+    /// extents partition it in order; on any other input the catalog is still a mere hint. Blob ids
+    /// are those of `index`: the catalog serves as a base of a pack whose blob ids are the same, a
+    /// pack seeded with that index.
+    ///
+    /// # Errors
+    /// [`Error::MalformedIndex`] if the member's extent or tensor ranges or a tensor name lie outside
+    /// their sections.
+    pub(crate) fn from_member(index: &Index, member: &MemberRecord) -> Result<Self, Error> {
+        let extents = index.member_extents(member)?;
+        let records = index.member_tensors(member)?;
+        let mut tensors = Vec::with_capacity(records.len());
+        for tensor in records {
+            tensors.push(TensorRef {
+                name: index.string(tensor.name)?,
+                offset: tensor.virt_offset,
+                len: tensor.virt_len,
+                dtype: tensor.dtype,
+            });
+        }
+        Ok(Self::from_tensors(tensors.into_iter(), extents))
+    }
+
+    /// The common part of both constructors: `tensors` in table order, since the first of two
+    /// tensors with one name is the one that pairs by it.
+    fn from_tensors<'t>(
+        tensors: impl Iterator<Item = TensorRef<'t>>,
+        extents: &[ExtentRecord],
+    ) -> Self {
         let mut catalog = Self::default();
         for tensor in tensors {
             let Some(base) = base_tensor(tensor, extents) else {
@@ -127,7 +186,7 @@ impl BaseCatalog {
 }
 
 /// `tensor` with the blob range of the identity extent it starts in, if there is one.
-fn base_tensor(tensor: &TensorInfo, extents: &[ExtentRecord]) -> Option<BaseTensor> {
+fn base_tensor(tensor: TensorRef<'_>, extents: &[ExtentRecord]) -> Option<BaseTensor> {
     // Extents are sorted by `virt_offset` and partition the member.
     let after = extents.partition_point(|extent| extent.virt_offset <= tensor.offset);
     let extent = extents.get(after.checked_sub(1)?)?;
@@ -137,7 +196,7 @@ fn base_tensor(tensor: &TensorInfo, extents: &[ExtentRecord]) -> Option<BaseTens
     let into = tensor.offset.checked_sub(extent.virt_offset)?;
     let available = extent.virt_len.checked_sub(into)?;
     Some(BaseTensor {
-        name: tensor.name.clone(),
+        name: tensor.name.to_owned(),
         len: tensor.len,
         dtype: tensor.dtype,
         range: BaseRange {
@@ -173,6 +232,11 @@ mod tests {
 
     fn tensor(name: &str, offset: u64, len: u64) -> TensorInfo {
         TensorInfo { name: name.to_owned(), offset, len, shape: vec![len / 2], dtype: Dtype::Bf16 }
+    }
+
+    /// A plan holding `tensors` and no ranges: all a catalog reads of a plan.
+    fn plan_of(tensors: &[TensorInfo]) -> RangePlan {
+        RangePlan { profile: Profile::Safetensors, ranges: Vec::new(), tensors: tensors.to_vec() }
     }
 
     fn extent(virt_offset: u64, virt_len: u64, blob_id: u32, view: View) -> ExtentRecord {
@@ -211,7 +275,7 @@ mod tests {
     fn a_pair_needs_the_same_length_and_dtype() {
         let tensors = [tensor("a.weight", 0, 8192), tensor("model.b.weight", 8192, 8192)];
         let extents = [extent(0, 8192, 0, View::Identity), extent(8192, 8192, 1, View::Identity)];
-        let catalog = BaseCatalog::new(&tensors, &extents);
+        let catalog = BaseCatalog::from_plan(&plan_of(&tensors), &extents);
         assert_eq!(catalog.len(), 2);
         let found = catalog.pair(&tensor("a.weight", 100, 8192)).expect("same name");
         assert_eq!(found.range, BaseRange { file_offset: 0, blob: 0, blob_offset: 0 });
@@ -235,7 +299,7 @@ mod tests {
             extent(8192, 8192, 1, View::Identity),
             extent(16384, 16384, 2, View::Bf16ToF32),
         ];
-        let catalog = BaseCatalog::new(&tensors, &extents);
+        let catalog = BaseCatalog::from_plan(&plan_of(&tensors), &extents);
         assert_eq!(catalog.len(), 2, "the widened tensor is left out");
         assert!(catalog.pair(&tensor("x", 0, 8192)).is_none(), "two bases normalize to x");
         assert!(catalog.pair(&tensor("model.x", 0, 8192)).is_some(), "the exact name still pairs");
@@ -246,7 +310,7 @@ mod tests {
         let tensors = [tensor("t", 100, 8192)];
         let extents =
             [ExtentRecord { blob_offset: 4, ..extent(0, 9000, 3, View::Identity) }];
-        let catalog = BaseCatalog::new(&tensors, &extents);
+        let catalog = BaseCatalog::from_plan(&plan_of(&tensors), &extents);
         let base = catalog.pair(&tensor("t", 0, 8192)).expect("pairs");
         assert_eq!(base.range, BaseRange { file_offset: 100, blob: 3, blob_offset: 104 });
         assert_eq!(base.available, 8900);
@@ -256,7 +320,7 @@ mod tests {
     fn bases_of_follows_the_ranges_of_a_plan() {
         let tensors = [tensor("a", 0, 8192), tensor("b", 8192, 8192)];
         let extents = [extent(0, 8192, 0, View::Identity), extent(8192, 8192, 1, View::Identity)];
-        let catalog = BaseCatalog::new(&tensors, &extents);
+        let catalog = BaseCatalog::from_plan(&plan_of(&tensors), &extents);
         let plan = RangePlan {
             profile: Profile::Safetensors,
             ranges: vec![

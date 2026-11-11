@@ -327,19 +327,29 @@ fn read_index(
     }
     let mut stored = vec![0; stored_len];
     source.read_exact_at(footer.index_offset, &mut stored)?;
-    let raw = decompress_index(&stored, raw_len)?;
+    let raw = decompress_index(&stored, raw_len, footer.index_offset)?;
     footer.check_index(&raw)?;
     Ok((header, footer, raw))
 }
 
-/// Decompresses a stored index into a new buffer of exactly `raw_len` bytes.
+/// Decompresses a stored index, read from file offset `offset`, into a new buffer of exactly
+/// `raw_len` bytes.
 ///
 /// # Errors
 /// Returns [`Error::MalformedIndex`] for section `"index"` unless `stored` is exactly one frame that
-/// declares `raw_len` bytes and yields that many, and [`Error::Zstd`] if zstd cannot decode it.
-fn decompress_index(stored: &[u8], raw_len: usize) -> Result<Vec<u8>, Error> {
+/// declares `raw_len` bytes and yields that many, and [`Error::Zstd`] if zstd cannot decode it; its
+/// detail names the stored index, its length and offset, since zstd's own text ("Data corruption
+/// detected") says nothing of where.
+fn decompress_index(stored: &[u8], raw_len: usize, offset: u64) -> Result<Vec<u8>, Error> {
     let malformed = |detail: String| Error::MalformedIndex { section: "index", detail };
-    let zstd_error = |error: std::io::Error| Error::Zstd { detail: error.to_string() };
+    let context_error =
+        |error: std::io::Error| Error::Zstd { detail: format!("no decompression context: {error}") };
+    let decode_error = |error: std::io::Error| Error::Zstd {
+        detail: format!(
+            "the stored index ({} bytes at offset {offset}) does not decode: {error}",
+            stored.len()
+        ),
+    };
     if !stored.starts_with(&ZSTD_MAGIC) {
         return Err(malformed("the stored index does not start with a zstd frame".to_owned()));
     }
@@ -361,9 +371,9 @@ fn decompress_index(stored: &[u8], raw_len: usize) -> Result<Vec<u8>, Error> {
     }
     let mut raw = vec![0; raw_len];
     let written = Decompressor::new()
-        .map_err(zstd_error)?
+        .map_err(context_error)?
         .decompress_to_buffer(stored, raw.as_mut_slice())
-        .map_err(zstd_error)?;
+        .map_err(decode_error)?;
     if written != raw_len {
         return Err(malformed(format!("decompressed {written} bytes, expected {raw_len}")));
     }
@@ -402,4 +412,37 @@ fn tensor_table(index: &Index) -> Result<Vec<TensorInfo>, Error> {
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decompress_index;
+    use crate::error::Error;
+
+    #[test]
+    fn an_index_zstd_cannot_decode_is_named_with_its_place() {
+        // Compressible, so the frame holds compressed blocks whose damage zstd reports.
+        let raw: Vec<u8> = (0..4096_u32).flat_map(|i| (i % 251).to_le_bytes()).collect();
+        let stored = zstd::bulk::compress(&raw, 3).expect("compresses");
+        assert_eq!(decompress_index(&stored, raw.len(), 77).expect("decodes"), raw);
+        let place = format!("the stored index ({} bytes at offset 77) does not decode: ", stored.len());
+        let mut zstd_failures = 0;
+        // Damage each byte after the frame header in turn: whatever zstd says is either a
+        // malformed frame or a Zstd error naming the stored index; it never decodes to `raw`.
+        for at in 6..stored.len() {
+            let mut damaged = stored.clone();
+            damaged[at] ^= 0x5A;
+            match decompress_index(&damaged, raw.len(), 77) {
+                Err(Error::Zstd { detail }) => {
+                    assert!(detail.starts_with(&place), "{detail}");
+                    zstd_failures += 1;
+                }
+                Err(Error::MalformedIndex { section: "index", .. }) => {}
+                // Damage zstd does not see is left to the index hash, checked after this.
+                Ok(decoded) => assert_ne!(decoded, raw, "byte {at}"),
+                Err(other) => panic!("byte {at}: {other:?}"),
+            }
+        }
+        assert!(zstd_failures > 0, "no damage reached the decoder");
+    }
 }

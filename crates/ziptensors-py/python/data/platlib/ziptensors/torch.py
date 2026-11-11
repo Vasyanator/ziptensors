@@ -593,10 +593,11 @@ def load_state_dict(
     `staging_bytes` each (default `STAGING_BYTES`, capped at the total size asked for) and copied
     asynchronously on a side stream while the next piece decodes; the call returns after every copy
     is done. Host memory then peaks at the two buffers, which torch's caching host allocator keeps
-    pinned for reuse after the call, and the device holds the state dict. On any
-    other device each tensor is decoded on the host, moved, and its host copy freed before the next
-    one, so host memory peaks at the largest tensor. Both add the decode scratch of the memory
-    contract in `ARCHITECTURE.md`.
+    pinned for reuse after the call, and the device holds the state dict. On `cpu` the decoded
+    tensors are the result, so host memory holds the whole state dict. On any other device each
+    tensor is decoded on the host, moved, and its host copy freed before the next one, so host
+    memory peaks at the largest tensor. All add the decode scratch of the memory contract in
+    `ARCHITECTURE.md`.
 
     `dtype`, a floating point torch dtype, converts floating point tensors after decoding: on the
     device for `cuda`, otherwise on the host. Integer, bool and quantized tensors keep their dtype,

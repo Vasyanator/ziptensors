@@ -1,7 +1,8 @@
 //! File: tests/fuse.rs
 //! Purpose: the Linux FUSE backend end to end: mount a real container under the temp directory, read
 //! every member through the kernel (whole, positional, and through `mmap` in a Python child), compare
-//! with the core's `read_at`, unmount, and check that no mount is left.
+//! with the core's `read_at`, unmount, and check that no mount is left. The same for an overlay of a
+//! model directory with per-file containers, including a file changed after the mount.
 //!
 //! Implementation notes: skips with one line on stderr unless `/dev/fuse` opens for reading and writing
 //! and `fusermount3` is on `PATH`, so it passes in a container without FUSE. The `MountHandle` unmounts
@@ -28,9 +29,9 @@ use nix::errno::Errno;
 use nix::unistd::{AccessFlags, access};
 
 use ziptensors_core::{CacheOptions, Container, OpenOptions, ReadCache};
-use ziptensors_mount::{FuseOptions, MountFs, PosixPolicy, mount};
+use ziptensors_mount::{FuseOptions, MountFs, OverlayOptions, PosixPolicy, mount};
 
-use testkit::{Fixture, Scratch};
+use testkit::{Fixture, OverlayFixture, Scratch};
 
 /// Whether this machine can mount without privileges; `None` if it can, else why not.
 fn fuse_unavailable() -> Option<String> {
@@ -177,5 +178,95 @@ fn an_unmount_detaches_at_once_and_serves_an_open_file_until_it_is_closed() {
     assert!(!unmounting.is_finished(), "the unmount waits for the open file");
     drop(file);
     unmounting.join().expect("the unmount thread").expect("unmount");
+    assert!(!mounted(&mountpoint), "no mount is left");
+}
+
+/// Every file and directory below `dir`, `/`-separated relative to `base`, sorted; links included as
+/// files.
+fn walk(base: &Path, dir: &Path, files: &mut Vec<String>, dirs: &mut Vec<String>) {
+    for entry in fs::read_dir(dir).expect("list") {
+        let path = entry.expect("entry").path();
+        let rel = path.strip_prefix(base).expect("below the base").to_str().expect("UTF-8").to_owned();
+        if fs::symlink_metadata(&path).expect("stat").is_dir() {
+            dirs.push(rel);
+            walk(base, &path, files, dirs);
+        } else {
+            files.push(rel);
+        }
+    }
+    files.sort();
+    dirs.sort();
+}
+
+#[test]
+fn an_overlay_mount_serves_a_model_directory_and_fails_reads_of_a_changed_file() {
+    if let Some(reason) = fuse_unavailable() {
+        eprintln!("skipped: {reason}");
+        return;
+    }
+    let scratch = Scratch::new("fuse-overlay");
+    let fixture = OverlayFixture::standard(&scratch);
+    let mountpoint = scratch.path().join("mnt");
+    fs::create_dir(&mountpoint).expect("create mountpoint");
+    let fs = Arc::new(MountFs::overlay(&fixture.root, PosixPolicy, &OverlayOptions::default()).expect("mountable"));
+    let fuse_options = FuseOptions { threads: 4, fs_name: fixture.root.display().to_string() };
+    let handle = mount(Arc::clone(&fs), &mountpoint, &fuse_options).expect("mount");
+    assert!(mounted(&mountpoint), "the mount is listed in /proc/mounts");
+
+    // Changed on disk before any read through the mount: its reads fail, never mixing bytes.
+    let changed = "notes/readme.txt";
+    fs::write(fixture.root.join(changed), b"a different and longer text than the snapshot had").expect("rewrite");
+
+    let (mut files, mut dirs) = (Vec::new(), Vec::new());
+    walk(&mountpoint, &mountpoint, &mut files, &mut dirs);
+    let shown: Vec<&str> = fixture.shown.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(files, shown);
+    assert_eq!(dirs, fixture.dirs);
+    for name in fixture.containers.iter().chain(&fixture.hidden) {
+        let error = fs::symlink_metadata(mountpoint.join(name)).expect_err("not shown");
+        assert_eq!(error.kind(), ErrorKind::NotFound, "{name}");
+    }
+    let time = |path: &Path| fs::metadata(path).and_then(|meta| meta.modified()).expect("time");
+    assert_eq!(time(&mountpoint.join("unet")), time(&fixture.root.join("unet")));
+    assert_eq!(
+        time(&mountpoint.join("unet/diffusion_pytorch_model.safetensors")),
+        time(&fixture.root.join("unet/diffusion_pytorch_model.ziptensors"))
+    );
+
+    let mut python = true;
+    for (name, content) in &fixture.shown {
+        let path = mountpoint.join(name);
+        let meta = fs::metadata(&path).expect("stat");
+        assert_eq!(meta.len(), u64::try_from(content.len()).expect("small"), "{name}");
+        assert_eq!(meta.permissions().mode() & 0o777, 0o444, "{name}");
+        if name == changed {
+            let error = fs::read(&path).expect_err("a changed file fails");
+            assert_eq!(error.raw_os_error(), Some(Errno::EIO as i32), "{name}: {error}");
+            continue;
+        }
+        assert_eq!(&fs::read(&path).expect("read through the mount"), content, "{name}");
+        let file = fs::File::open(&path).expect("open");
+        for (offset, len) in [(0_usize, 8_usize), (1_000_003, 300_000), (content.len() / 2, 4097)] {
+            let offset = offset.min(content.len());
+            let len = len.min(content.len() - offset);
+            let mut got = vec![0; len];
+            file.read_exact_at(&mut got, u64::try_from(offset).expect("small")).expect("positional read");
+            assert_eq!(got, content[offset..offset + len], "{name} at {offset}");
+        }
+        drop(file);
+        if python {
+            match read_through_mmap(&path) {
+                Some(mapped) => assert_eq!(&mapped, content, "{name} through mmap"),
+                None => {
+                    eprintln!("mmap comparison skipped: python3 is not on PATH");
+                    python = false;
+                }
+            }
+        }
+    }
+    assert_eq!(fixture.content("config.json"), fs::read(mountpoint.join("config.json")).expect("read again"));
+    assert!(fs.stats().misses > 0, "members were read through a cache");
+
+    handle.unmount().expect("unmount");
     assert!(!mounted(&mountpoint), "no mount is left");
 }

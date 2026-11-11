@@ -1010,17 +1010,20 @@ dependencies = [
 
 [[package]]
 name = "ziptensors-capi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
+ "blake3",
  "cbindgen",
  "thiserror",
  "tracing",
+ "tracing-subscriber",
  "ziptensors-core",
+ "zstd",
 ]
 
 [[package]]
 name = "ziptensors-cli"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1033,7 +1036,7 @@ dependencies = [
 
 [[package]]
 name = "ziptensors-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "rayon",
@@ -1045,7 +1048,7 @@ dependencies = [
 
 [[package]]
 name = "ziptensors-mount"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "fuser",
  "nix",
@@ -1057,10 +1060,13 @@ dependencies = [
 
 [[package]]
 name = "ziptensors-py"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pyo3",
+ "tracing",
+ "tracing-subscriber",
  "ziptensors-core",
+ "ziptensors-mount",
 ]
 
 [[package]]

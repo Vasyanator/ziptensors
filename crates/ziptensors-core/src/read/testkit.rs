@@ -384,7 +384,8 @@ pub(crate) fn finish_file(mut file: Vec<u8>, raw_index: &[u8]) -> Vec<u8> {
     let stored = zstd::bulk::compress(raw_index, 3).expect("zstd compresses an index");
     let index_offset = file.len() as u64;
     file.extend_from_slice(&stored);
-    let footer = Footer::for_index(index_offset, stored.len() as u64, raw_index);
+    let generation = crate::format::GENERATION_INITIAL;
+    let footer = Footer::for_index(index_offset, stored.len() as u64, raw_index, generation);
     file.extend_from_slice(&footer.to_bytes());
     file
 }

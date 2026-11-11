@@ -2,7 +2,8 @@
 //! Purpose: the writing half of the C ABI: one-shot encode and the pack builder.
 //!
 //! Main responsibilities: [`zt_encode_file`], the opaque handle [`ZtPack`] and its entry points over
-//! `PackBuilder`.
+//! `PackBuilder`: plain files, files stored against a delta base, and members copied from another
+//! container.
 //!
 //! Key structures: [`ZtPack`].
 //!
@@ -15,9 +16,10 @@ use std::ffi::c_char;
 
 use ziptensors_core::{EncodeOptions, PackBuilder, encode_file};
 
-use crate::args::{handle_mut, path, reset_out, text};
+use crate::args::{handle, handle_mut, path, reset_out, text};
 use crate::barrier::{guarded, guarded_value};
 use crate::options::{ZtEncodeOptions, encode_options};
+use crate::read::ZtContainer;
 use crate::status::{Failure, ZtStatus};
 
 /// A container being written. Create with `zt_pack_new`, then call `zt_pack_add_file` for each input and
@@ -104,7 +106,7 @@ pub unsafe extern "C" fn zt_pack_new(
 /// call on the pack fails too.
 ///
 /// Returns `ZT_STATUS_UNSAFE_MEMBER_NAME` if a restore would refuse `member`,
-/// `ZT_STATUS_MALFORMED_INDEX` if the pack has a member of this name, `ZT_STATUS_SYMLINK_INPUT`,
+/// `ZT_STATUS_DUPLICATE_MEMBER` if the pack has a member of this name, `ZT_STATUS_SYMLINK_INPUT`,
 /// `ZT_STATUS_IO` and `ZT_STATUS_INPUT_CHANGED` as `zt_encode_file`, and `ZT_STATUS_INVALID_STATE` after
 /// `zt_pack_finish`.
 ///
@@ -126,6 +128,78 @@ pub unsafe extern "C" fn zt_pack_add_file(
         let member = unsafe { text(member, "member") }?;
         let mut builder = pack.take()?;
         let added = builder.add_file(input, member);
+        pack.builder = Some(builder);
+        added?;
+        Ok(())
+    })
+}
+
+/// Adds the file at `path` as the member `member`, as `zt_pack_add_file` does, and stores its tensors
+/// that pair with tensors of `base_member` as delta blobs where that is smaller. A tensor pairs with a
+/// base tensor of the same name (or the same name without a publication prefix), length and dtype.
+/// Only `ZT_MODE_MAX` stores delta blobs; under the other modes this is `zt_pack_add_file` after the
+/// check of `base_member`. A reader needs a library with delta support (format feature bit 0).
+///
+/// `base_member` must be a member this pack added from a file, and that file must still be as it was:
+/// it is read again. Returns `ZT_STATUS_MEMBER_NOT_FOUND` if the pack added no such member from a file,
+/// `ZT_STATUS_INPUT_CHANGED` if the base file changed, and every status of `zt_pack_add_file`. On
+/// failure the pack is as `zt_pack_add_file` leaves it.
+///
+/// # Safety
+/// `pack` must be NULL or a live handle no other thread is using. `path`, `member` and `base_member`
+/// must be NULL or NUL-terminated, and are only read during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zt_pack_add_file_delta(
+    pack: *mut ZtPack,
+    path: *const c_char,
+    member: *const c_char,
+    base_member: *const c_char,
+) -> ZtStatus {
+    guarded("zt_pack_add_file_delta", || {
+        // SAFETY: `pack` is covered by this function's contract and is exclusive for the call.
+        let pack = unsafe { handle_mut(pack, "pack") }?;
+        // SAFETY: `path` is covered by this function's contract and outlives the call.
+        let input = unsafe { self::path(path, "path") }?;
+        // SAFETY: `member` is covered by this function's contract and outlives the call.
+        let member = unsafe { text(member, "member") }?;
+        // SAFETY: `base_member` is covered by this function's contract and outlives the call.
+        let base_member = unsafe { text(base_member, "base_member") }?;
+        let mut builder = pack.take()?;
+        let added = builder.add_file_delta(input, member, base_member);
+        pack.builder = Some(builder);
+        added?;
+        Ok(())
+    })
+}
+
+/// Copies the member `member` of the open container `source` into the pack under the same name, with
+/// no decoding and no recompression. Its bytes are proven against the hash `source` states when the
+/// pack is finished. `source` must stay open until this call returns; the pack keeps what it needs.
+///
+/// Returns `ZT_STATUS_MEMBER_NOT_FOUND` if `source` has no such member,
+/// `ZT_STATUS_UNSAFE_MEMBER_NAME` if a restore would refuse the name, `ZT_STATUS_DUPLICATE_MEMBER` if
+/// the pack has a member of this name, `ZT_STATUS_IO` if a read or a write fails, and
+/// `ZT_STATUS_INVALID_STATE` after `zt_pack_finish`. On failure the pack is as `zt_pack_add_file`
+/// leaves it.
+///
+/// # Safety
+/// `pack` must be NULL or a live handle no other thread is using. `source` must be NULL or a live
+/// container handle. `member` must be NULL or NUL-terminated, and is only read during the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zt_pack_add_member_from(
+    pack: *mut ZtPack,
+    source: *const ZtContainer,
+    member: *const c_char,
+) -> ZtStatus {
+    guarded("zt_pack_add_member_from", || {
+        // SAFETY: `pack` is covered by this function's contract and is exclusive for the call.
+        let pack = unsafe { handle_mut(pack, "pack") }?;
+        // SAFETY: `source` is covered by this function's contract and is shared for the call.
+        let source = unsafe { handle(source, "source") }?;
+        // SAFETY: `member` is covered by this function's contract and outlives the call.
+        let member = unsafe { text(member, "member") }?;
+        let mut builder = pack.take()?;
+        let added = builder.add_member_from(&source.inner, member);
         pack.builder = Some(builder);
         added?;
         Ok(())

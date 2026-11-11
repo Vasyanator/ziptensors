@@ -92,7 +92,8 @@ pub fn validate(
 ///
 /// # Errors
 /// - [`Error::BudgetExceeded`] with `what` `"total decoded size"` if the sum of `file_len` is over
-///   [`Limits::max_total_decoded`]. A sum that overflows `u64` is reported as `u64::MAX`.
+///   [`Limits::max_total_decoded`]; `declared` is that whole sum over `members`, not a partial one. A
+///   sum that overflows `u64` is reported as `u64::MAX`.
 /// - [`Error::BudgetExceeded`] with `what` `"decode work"` if the work of all of them is over
 ///   [`Limits::max_decode_amplification`] × the sum of `file_len` + [`DECODE_WORK_FLOOR`], one floor
 ///   however many members there are. Values over `u64` are
@@ -108,22 +109,20 @@ pub fn check_decode_budget(
     let work = decode_work_totals(index)?;
     let mut total: u64 = 0;
     let mut total_work: u128 = 0;
+    let exceeded = |declared| Error::BudgetExceeded { what: "total decoded size", declared, limit };
     for id in members {
         let member = usize::try_from(id)
             .ok()
             .and_then(|id| index.members().get(id))
             .ok_or_else(|| Error::MemberNotFound { name: format!("#{id}") })?;
-        let exceeded = |declared| Error::BudgetExceeded {
-            what: "total decoded size",
-            declared,
-            limit,
-        };
         total = total.checked_add(member.file_len).ok_or_else(|| exceeded(u64::MAX))?;
-        if total > limit {
-            return Err(exceeded(total));
-        }
         // Saturating cannot matter: a sum this large is over any limit `check_total_work` can state.
         total_work = total_work.saturating_add(member_work(member, &work)?);
+    }
+    // Compared once the sum is complete, so the error reports what the whole request would decode,
+    // not the running sum at the member that crossed the limit.
+    if total > limit {
+        return Err(exceeded(total));
     }
     check_total_work(total_work, total, limits)
 }

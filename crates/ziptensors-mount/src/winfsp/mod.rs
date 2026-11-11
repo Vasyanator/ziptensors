@@ -4,15 +4,16 @@
 //!
 //! Main responsibilities:
 //! - [`mount`]: checks the tree, the mount point and the path lengths, creates the volume, mounts it
-//!   and starts `WinFsp`'s dispatcher; [`MountHandle`] unmounts on drop;
+//!   and starts `WinFsp`'s dispatcher; [`MountHandle`] unmounts on drop, under the contract of
+//!   `handle.rs`;
 //! - [`MountHandle::unmount`]: removes the mount point at once, waits until every file still open is
-//!   closed, then stops the volume;
+//!   closed, then stops the volume; [`MountHandle::wait`]: waits for the driver to stop it;
 //! - [`run_until_signal`]: a foreground mount that a first Ctrl-C or Ctrl-Break detaches and a second
 //!   abandons ([`MountEnd`]);
 //! - [`probe`]: whether `WinFsp` is installed, and its version.
 //!
 //! Key structures: [`WinFspOptions`], [`MountHandle`], [`MountPoint`], [`WinFspError`],
-//! [`UnmountSignals`], [`ConsoleEvent`], [`MountEnd`].
+//! [`UnmountSignals`], [`ConsoleEvent`].
 //!
 //! Implementation notes:
 //! - The order is `WinFsp`'s: create the volume, set its user context, set the mount point, start the
@@ -38,24 +39,26 @@ mod security;
 mod volume;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime};
-use std::{env, fs, io, ptr};
+use std::{env, fs, io, ptr, thread};
 
 use windows_sys::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID};
 use windows_sys::Win32::Storage::FileSystem::{GetLogicalDrives, QueryDosDeviceW};
 
+use crate::error::MountError;
 use crate::fs::MountFs;
+use crate::handle::MountEnd;
 use crate::policy::{NamePolicy, WindowsPolicy};
 use crate::tree::NodeId;
 
-use abi::{DISK_DEVICE, FileSystem, VOLUME_NAME_UNITS};
+use abi::{DISK_DEVICE, FileSystem, NtStatus, VOLUME_NAME_UNITS};
 use console::{Action, Watch, step};
 use dll::{Api, Dll};
 use security::Security;
 use volume::Volume;
 
-pub use console::{ConsoleEvent, MountEnd, UnmountSignals};
+pub use console::{ConsoleEvent, UnmountSignals};
 pub use error::WinFspError;
 pub use names::MountPoint;
 
@@ -157,7 +160,7 @@ impl Live {
 }
 
 /// A live `WinFsp` mount. Dropping it unmounts as [`MountHandle::unmount`] does: the mount point goes at
-/// once, and the drop returns when the last file open under it is closed.
+/// once, and the drop returns when the last file open under it is closed. `Send`, not `Sync`.
 #[derive(Debug)]
 pub struct MountHandle {
     mountpoint: PathBuf,
@@ -322,15 +325,40 @@ impl MountHandle {
 
     /// Unmounts: removes the mount point at once, waits until every file still open is closed and
     /// unmapped (or the driver stops the volume), then stops and deletes the volume. While waiting it
-    /// reopens the files still counted open about once a second (`poke.rs`).
-    pub fn unmount(mut self) {
-        self.finish_unmount();
+    /// reopens the files still counted open about once a second (`poke.rs`). Blocks the calling thread
+    /// until then and takes no console key.
+    ///
+    /// # Errors
+    /// [`MountError::Stopped`] when the driver had stopped the volume on its own, a failure the
+    /// caller reports. The volume is deleted either way.
+    pub fn unmount(mut self) -> Result<(), MountError> {
+        self.finish_unmount()
+    }
+
+    /// Waits until the `WinFsp` driver stops the volume on its own (a dispatcher thread failed, or
+    /// `WinFsp` was uninstalled), deletes the volume and returns [`MountEnd::Stopped`]. Nothing outside
+    /// the process unmounts a `WinFsp` volume, so short of [`MountHandle::unmount`] from another owner
+    /// of the handle this is the only end; it blocks the calling thread and takes no console key.
+    ///
+    /// # Errors
+    /// None on this backend; the `Result` is the shared contract of `handle.rs`.
+    pub fn wait(mut self) -> Result<MountEnd, MountError> {
+        let Some(live) = self.live.take() else {
+            return Ok(MountEnd::Unmounted);
+        };
+        let status = wait_stopped(&live.volume);
+        // The status `stop` reads is the one just waited for: once set it never changes.
+        let status = self.stop(live).unwrap_or(status);
+        Ok(MountEnd::Stopped { status })
     }
 
     /// The whole unmount, once.
-    fn finish_unmount(&mut self) {
+    ///
+    /// # Errors
+    /// [`MountError::Stopped`] as [`MountHandle::unmount`].
+    fn finish_unmount(&mut self) -> Result<(), MountError> {
         let Some(live) = self.live.take() else {
-            return;
+            return Ok(());
         };
         if !live.detach() {
             tracing::info!(
@@ -342,11 +370,15 @@ impl MountHandle {
                 poke::poke(&live.volume);
             }
         }
-        self.stop(live);
+        match self.stop(live) {
+            None => Ok(()),
+            Some(status) => Err(MountError::Stopped { mountpoint: self.mountpoint.clone(), status }),
+        }
     }
 
-    /// Stops and deletes the volume now, cutting off any reader, and logs how it ended.
-    fn stop(&self, live: Live) {
+    /// Stops and deletes the volume now, cutting off any reader, and logs how it ended. Returns the
+    /// dispatcher's status when the driver had stopped the volume on its own.
+    fn stop(&self, live: Live) -> Option<NtStatus> {
         let stopped = live.volume.stop_status();
         drop(live);
         match stopped {
@@ -357,6 +389,7 @@ impl MountHandle {
                 "the WinFsp driver had stopped the volume"
             ),
         }
+        stopped
     }
 
     /// Leaves the volume serving the files still open, for a process about to exit: nothing waits, and
@@ -371,8 +404,34 @@ impl MountHandle {
 
 impl Drop for MountHandle {
     fn drop(&mut self) {
-        self.finish_unmount();
+        // `stop` has logged a driver stop with its status and mount point; a drop has no other channel.
+        if let Err(error) = self.finish_unmount() {
+            tracing::debug!(%error, "the dropped mount handle did not end cleanly");
+        }
     }
+}
+
+/// Blocks until the driver stops `volume` on its own and returns the dispatcher's status. Listens on
+/// a channel of its own for the duration, so no foreground mount may listen at the same time (a
+/// handle is waited on by one owner).
+fn wait_stopped(volume: &Volume) -> NtStatus {
+    let (sender, receiver) = mpsc::channel();
+    // Listening before reading the status: a stop between the two is then seen by one of them.
+    volume.listen(Some(sender));
+    let status = loop {
+        if let Some(status) = volume.stop_status() {
+            break status;
+        }
+        // Every wake-up re-reads the status; only `Wake::Stopped` can come, since nothing detaches.
+        if receiver.recv().is_err() {
+            // Cannot happen while listening: the volume holds the sender. Polling keeps the wait
+            // correct even so.
+            tracing::warn!("the stop channel of the volume closed; polling for the stop");
+            thread::sleep(POKE_INTERVAL);
+        }
+    };
+    volume.listen(None);
+    status
 }
 
 /// Serves `handle` until it ends: a first Ctrl-C or Ctrl-Break removes the mount point (files still
@@ -402,7 +461,10 @@ pub fn run_until_signal(mut handle: MountHandle, signals: &UnmountSignals) -> Mo
             Action::Finish if volume.open_files() == 0 => break MountEnd::Unmounted,
             Action::Ignore | Action::Finish => {}
             Action::DriverStopped => break MountEnd::Stopped { status: volume.stop_status().unwrap_or(0) },
-            Action::Abandon(event) => break MountEnd::Abandoned { event },
+            Action::Abandon(event) => {
+                tracing::warn!(event = event.as_str(), "second console event: ending without waiting for open files");
+                break MountEnd::Abandoned { signal: event.signal() };
+            }
             Action::Poke => {
                 poke::poke(&volume);
             }
@@ -424,14 +486,12 @@ pub fn run_until_signal(mut handle: MountHandle, signals: &UnmountSignals) -> Mo
     drop(volume);
     match end {
         MountEnd::Unmounted | MountEnd::Stopped { .. } => {
+            // A driver stop is in `end` already, and `stop` logs it.
             if let Some(live) = handle.live.take() {
                 handle.stop(live);
             }
         }
-        MountEnd::Abandoned { event } => {
-            tracing::warn!(event = event.as_str(), "second console event: ending without waiting for open files");
-            handle.abandon();
-        }
+        MountEnd::Abandoned { .. } => handle.abandon(),
     }
     end
 }
@@ -448,7 +508,7 @@ mod tests {
         STATUS_ACCESS_DENIED, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_INVALID, STATUS_SUCCESS,
     };
 
-    use super::{MountPoint, WinFspError, WinFspOptions, mount, preflight_result, probe};
+    use super::{MountPoint, WinFspError, WinFspOptions, mount, preflight_result, probe, wait_stopped};
     use crate::fs::MountFs;
     use crate::policy::{PosixPolicy, WindowsPolicy};
     use crate::testkit::{Fixture, Scratch};
@@ -537,6 +597,21 @@ mod tests {
             "{error}"
         );
         assert!(super::drive_in_use('1'), "not a letter");
+    }
+
+    /// `MountHandle::wait` without `WinFsp`: the wait ends on the driver's stop, also one recorded
+    /// before it began.
+    #[test]
+    fn a_wait_ends_when_the_driver_stops_the_volume() {
+        let scratch = Scratch::new("winfsp-wait");
+        let volume = Arc::new(crate::winfsp::volume::tests::volume(&scratch));
+        let waiting = {
+            let volume = Arc::clone(&volume);
+            std::thread::spawn(move || wait_stopped(&volume))
+        };
+        volume.stopped(-7);
+        assert_eq!(waiting.join().expect("the waiting thread"), -7);
+        assert_eq!(wait_stopped(&volume), -7, "a stop recorded before the wait");
     }
 
     #[test]

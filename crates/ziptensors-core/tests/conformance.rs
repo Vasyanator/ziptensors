@@ -7,7 +7,8 @@
 //!   delta blobs of version 0.3 (spec section 7a) in [`accept_delta`];
 //! - [`reject_cases`]: invalid files, each citing the spec rule it breaks and where it must fail;
 //!   invariant 13 in [`reject_delta`];
-//! - [`restore_name_cases`]: invariant 11, which is about strings and not files.
+//! - [`restore_name_cases`]: invariant 11, which is about strings and not files;
+//! - [`recover_cases`]: the recovery procedure of spec section 9.3, over the scan and the tool.
 //!
 //! Key structures: `File` (a whole file as plain fields), `Section`, `Accept`, `Reject`, `Want`.
 //!
@@ -22,12 +23,17 @@
 //! `MalformedIndex` for one of many rules, so they also name words of this implementation's message
 //! (`Reject::because`): a case cannot then pass by breaking an earlier rule by accident.
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use blake3::hash as blake3_hash;
 use xxhash_rust::xxh3::xxh3_64;
 use ziptensors_core::format::check_restore_name;
-use ziptensors_core::{Container, Dtype, Error, ErrorCode, OpenOptions, RandomAccess};
+use ziptensors_core::{
+    Candidate, Container, Dtype, Error, ErrorCode, OpenOptions, RandomAccess, RecoverOptions,
+    ScanBudget, ScanOutcome, find_last_valid_generation, recover,
+};
 
 /// `planes(2)`: step id, `param0`, `param1`.
 const PLANES_2: (u16, u16, u32) = (0x0101, 2, 0);
@@ -694,7 +700,7 @@ fn accept_cases() -> Vec<Accept> {
         section.count = to_u64(section.body.len());
     });
     list.base("an-update-appended-after-an-old-index", |file| {
-        // The old index and footer of spec section 10 are just unreferenced bytes now.
+        // The old index and footer of spec section 9.3 are just unreferenced bytes now.
         let old = File::base().to_bytes();
         let appended = &old[84..];
         file.data.extend_from_slice(appended);
@@ -1467,8 +1473,10 @@ fn restore_names_follow_invariant_11() {
 fn case_names_are_unique() {
     let accepted = accept_cases();
     let rejected = reject_cases();
+    let recovered = recover_cases();
     let mut names: Vec<&str> = accepted.iter().map(|case| case.name).collect();
     names.extend(rejected.iter().map(|case| case.name));
+    names.extend(recovered.iter().map(|case| case.name));
     let total = names.len();
     names.sort_unstable();
     names.dedup();
@@ -1487,4 +1495,197 @@ fn the_empty_container_is_exactly_these_bytes() {
     assert_eq!(hex(&bytes), EMPTY_CONTAINER_HEX);
     let container = open(bytes).expect("the smallest valid file");
     assert!(container.members().is_empty());
+}
+
+/// The base file with a second generation appended: the base's stored index and footer become data
+/// bytes, followed by the same index again and a footer of generation 2 (spec section 9.3). Returns
+/// the file and the length of the first generation, which is the base file.
+fn two_generations() -> (File, usize) {
+    let old = File::base().to_bytes();
+    let mut file = File::base();
+    // The base data is one 20-byte chunk at 64; everything after it is the old index and footer.
+    file.data.extend_from_slice(&old[84..]);
+    file.generation = 2;
+    (file, old.len())
+}
+
+/// What recovering a file must give.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recovered {
+    /// The file opens as it is, its footer of this generation, and is left alone.
+    AsIs(u64),
+    /// The file is cut to this length, which ends a footer of this generation.
+    Cut(usize, u64),
+    /// No valid generation: `Unrecoverable`, the file unchanged.
+    Unrecoverable,
+}
+
+/// A file for the recovery procedure and its expected outcome.
+#[derive(Debug)]
+struct RecoverCase {
+    name: &'static str,
+    file: Vec<u8>,
+    want: Recovered,
+}
+
+/// The cases of spec section 9.3: torn appends of every kind, the newest of two generations, an
+/// older generation behind an invalid newer one, a valid file followed by trailing bytes, and files
+/// with no valid generation.
+fn recover_cases() -> Vec<RecoverCase> {
+    let base = File::base().to_bytes();
+    let (two, first_len) = two_generations();
+    let two = two.to_bytes();
+    let case = |name, file, want| RecoverCase { name, file, want };
+    let with = |head: &[u8], tail: &[u8]| [head, tail].concat();
+    let footer_at = two.len() - 64;
+    let mut bad_index_hash = two_generations().0;
+    bad_index_hash.index_xxh3_xor = 1;
+    let mut bad_footer_hash = two_generations().0;
+    bad_footer_hash.footer_xxh3_xor = 1;
+    // The second index starts where the first file ended; moved to 63, it lies inside the header.
+    let mut index_in_header = two_generations().0;
+    index_in_header.index_offset_delta = 63 - i64::try_from(first_len).expect("small");
+    let mut no_footer = base.clone();
+    no_footer.truncate(base.len() - 64);
+    vec![
+        case("recover-valid-file-is-left-alone", two.clone(), Recovered::AsIs(2)),
+        case("recover-torn-tail-of-garbage", with(&base, &[0xA7; 100]), Recovered::Cut(base.len(), 1)),
+        case("recover-torn-tail-of-zeros", with(&base, &[0; 4096]), Recovered::Cut(base.len(), 1)),
+        case("recover-torn-tail-half-index", two[..first_len + 150].to_vec(), Recovered::Cut(first_len, 1)),
+        case("recover-torn-tail-index-without-footer", two[..footer_at].to_vec(), Recovered::Cut(first_len, 1)),
+        case("recover-torn-tail-half-footer", two[..footer_at + 32].to_vec(), Recovered::Cut(first_len, 1)),
+        case("recover-torn-tail-footer-but-its-last-byte", two[..two.len() - 1].to_vec(), Recovered::Cut(first_len, 1)),
+        case("recover-newest-of-two-generations", with(&two, b"torn third generation"), Recovered::Cut(two.len(), 2)),
+        case("recover-older-generation-behind-a-bad-index-hash", bad_index_hash.to_bytes(), Recovered::Cut(first_len, 1)),
+        case("recover-older-generation-behind-a-bad-footer-hash", bad_footer_hash.to_bytes(), Recovered::Cut(first_len, 1)),
+        case("recover-older-generation-behind-an-index-in-the-header", index_in_header.to_bytes(), Recovered::Cut(first_len, 1)),
+        case("recover-trailing-bytes-after-a-valid-file", with(&base, &[0x5A; 17]), Recovered::Cut(base.len(), 1)),
+        case("recover-one-trailing-byte", with(&base, &[0]), Recovered::Cut(base.len(), 1)),
+        case("recover-no-footer-at-all", no_footer, Recovered::Unrecoverable),
+        case("recover-header-and-garbage", with(&base[..64], &[0x11; 1000]), Recovered::Unrecoverable),
+    ]
+}
+
+/// What `find_last_valid_generation` gave against what the case wants, or `None`.
+fn scan_failure(case: &RecoverCase) -> Option<String> {
+    let source: Arc<dyn RandomAccess> = Arc::new(Memory(case.file.clone()));
+    let scan = find_last_valid_generation(&source, &OpenOptions::default(), &ScanBudget::default());
+    let scan = match scan {
+        Ok(scan) => scan,
+        Err(error) => return Some(format!("scan: {error:?}")),
+    };
+    let expected = match case.want {
+        Recovered::AsIs(generation) => {
+            ScanOutcome::Found(Candidate { valid_len: to_u64(case.file.len()), generation })
+        }
+        Recovered::Cut(len, generation) => {
+            ScanOutcome::Found(Candidate { valid_len: to_u64(len), generation })
+        }
+        Recovered::Unrecoverable => ScanOutcome::NoCandidate,
+    };
+    (scan.outcome != expected).then(|| format!("scan: {scan:?}"))
+}
+
+/// What `recover` did to the case written to `path` against what the case wants, or `None`.
+fn recover_failure(case: &RecoverCase, path: &std::path::Path) -> Option<String> {
+    if let Err(error) = fs::write(path, &case.file) {
+        return Some(format!("write: {error}"));
+    }
+    let outcome = recover(path, &RecoverOptions::default());
+    let after = match fs::read(path) {
+        Ok(after) => after,
+        Err(error) => return Some(format!("read: {error}")),
+    };
+    let len = to_u64(case.file.len());
+    match (case.want, outcome) {
+        (Recovered::AsIs(generation), Ok(report))
+            if !report.truncated
+                && report.valid_len == len
+                && report.generation == generation
+                && after == case.file =>
+        {
+            None
+        }
+        (Recovered::Cut(valid_len, generation), Ok(report))
+            if report.truncated
+                && report.valid_len == to_u64(valid_len)
+                && report.generation == generation
+                && report.verified_bytes == Some(16)
+                && after == case.file[..valid_len]
+                && open(after.clone()).is_ok() =>
+        {
+            None
+        }
+        (Recovered::Unrecoverable, Err(Error::Unrecoverable { .. })) if after == case.file => None,
+        (_, outcome) => Some(format!("recover: {outcome:?}, file of {} bytes", after.len())),
+    }
+}
+
+/// A unique scratch directory, removed on drop.
+struct Scratch(PathBuf);
+
+impl Scratch {
+    fn new(tag: &str) -> Self {
+        let name = format!("ziptensors-conformance-{tag}-{}", std::process::id());
+        let path = std::env::temp_dir().join(name);
+        fs::create_dir_all(&path).expect("scratch directory");
+        Self(path)
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            eprintln!("cannot remove {}: {error}", self.0.display());
+        }
+    }
+}
+
+#[test]
+fn the_recovery_procedure_finds_the_latest_valid_generation() {
+    let scratch = Scratch::new("recover");
+    let cases = recover_cases();
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|case| {
+            let path = scratch.0.join(case.name);
+            let failure = scan_failure(case).or_else(|| recover_failure(case, &path));
+            failure.map(|text| format!("{}: {text}", case.name))
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Every cut of a torn append, from one byte of the new generation to all but its last byte, gives
+/// back the old file byte for byte.
+#[test]
+fn every_cut_of_a_torn_append_recovers_the_previous_generation() {
+    let (two, first_len) = two_generations();
+    let two = two.to_bytes();
+    for cut in first_len + 1..two.len() {
+        let source: Arc<dyn RandomAccess> = Arc::new(Memory(two[..cut].to_vec()));
+        let scan = find_last_valid_generation(&source, &OpenOptions::default(), &ScanBudget::default());
+        let want = ScanOutcome::Found(Candidate { valid_len: to_u64(first_len), generation: 1 });
+        assert_eq!(scan.map(|scan| scan.outcome).ok(), Some(want), "cut at {cut}");
+    }
+}
+
+/// Spec section 9.3 step 3: a generation that passes the structural checks but whose member does not
+/// hash to its record is refused before anything is cut, unless verification is turned off.
+#[test]
+fn recovery_verifies_before_it_cuts() {
+    let scratch = Scratch::new("recover-verify");
+    let mut file = File::base();
+    file.poke(b"MEMB", 72, 0, 16, &[0xEE; 32]);
+    let valid = file.to_bytes();
+    let torn = [valid.as_slice(), &[0x33; 50]].concat();
+    let path = scratch.0.join("c");
+    fs::write(&path, &torn).expect("writes");
+    let error = recover(&path, &RecoverOptions::default()).expect_err("the member hash differs");
+    assert_eq!(error.code(), ErrorCode::VerifyFailed, "{error:?}");
+    assert_eq!(fs::read(&path).expect("reads"), torn);
+    let options = RecoverOptions { verify: false, ..RecoverOptions::default() };
+    let report = recover(&path, &options).expect("cuts");
+    assert_eq!((report.valid_len, report.truncated, report.verified_bytes), (to_u64(valid.len()), true, None));
+    assert_eq!(fs::read(&path).expect("reads"), valid);
 }

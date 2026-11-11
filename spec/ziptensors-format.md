@@ -83,7 +83,7 @@ The footer is the last 64 bytes of the file. Offsets are relative to the start o
 | 8 | 8 | index_stored_len | bytes of the stored index |
 | 16 | 8 | index_raw_len | bytes of the decompressed index |
 | 24 | 8 | index_xxh3 | XXH3 of the decompressed index |
-| 32 | 8 | generation | 1 in files written by this version; informational, no value is rejected |
+| 32 | 8 | generation | 1 in a fresh file; an edit writes the previous value + 1; informational, no value is rejected (section 9.3) |
 | 40 | 8 | reserved | zero |
 | 48 | 8 | footer_xxh3 | XXH3 of footer bytes `0..48` |
 | 56 | 8 | end_magic | ASCII `ZTS-END` followed by one zero byte |
@@ -586,10 +586,26 @@ the offending value. Each invariant has a reject test in the reference implement
     on `\`, is `..`. It has no `:`, which excludes drive prefixes and alternate streams. A reader never
     opens a path taken from a file except the caller's root joined with a name checked here, and
     nothing is written for a rejected name.
-12. A writer creates a temporary file in the output directory, decodes the full result and compares
-    BLAKE3 against the source hash, syncs the file, and only then renames it into place. There is no
-    way to disable this in version 0.1. On failure no final file exists and the temporary file is
-    removed.
+12. Commit protocols. A writer makes a file visible by one of the two protocols below, and neither
+    has a way to skip the decode. A file produced in any other way, such as by rewriting its bytes in
+    place, is outside this invariant, and an interruption can leave it damaged. A reader never
+    recovers on its own: a file whose last 64 bytes do not end a valid layout is rejected under
+    invariant 1, whatever older generation it contains (section 9.3).
+    - (a) Replace. The writer creates a temporary file in the output directory, decodes the full
+      result and compares BLAKE3 against the source hash, syncs the file, and only then renames it
+      into place. On failure no final file exists and the temporary file is removed.
+    - (b) Append, to a valid file of length `L`. No byte below `L` is written and the header stays as
+      it is, so the new index keeps every `BLOB`, `CHNK`, `CHAN` and `PARM` record of the old one (a
+      record no member reaches is legal, invariant 4), and an append adds a delta blob only to a file
+      whose required bit 0 is already set (invariant 13). The writer, in this order: writes the new
+      chunks from `L`; decodes every member of the result, read through the file with the new index
+      and footer after it, and compares BLAKE3 against the source hash, before any byte of the new
+      index is written; writes the stored index and syncs the file; writes the footer, with
+      `generation` one above the old footer's, and syncs the file again. A footer is therefore never
+      durable before the index and data it names. On failure before the second sync completes, the
+      writer truncates the file to `L`, which restores the old file byte for byte; if that truncation
+      fails, it reports that the file holds a valid generation of length `L` followed by trailing
+      bytes.
 13. Delta blobs satisfy the rules of section 7a: their `PARM` entry, their base, their chain, and the
     agreement of required feature bit 0 and of `PARM`'s required bit with the blobs.
 
@@ -623,6 +639,36 @@ Decoding a chunk's single compressed stream directly into the destination is an 
 applies only to a whole chunk with exactly one compressed stream, so a reader MUST also implement the
 scratch path, which every other chunk needs. The two produce identical bytes.
 
+### 9.3 Generations, appending and recovery
+
+`generation` in the footer is 1 in a fresh file, and an edit writes the previous value + 1. It is
+informational: a reader rejects no value and orders nothing by it.
+
+Appending to a file needs no version change: new data follows the old index, then a new index and a
+footer, and the old index and footer become unreferenced bytes of the data region, which invariant 4
+allows. Under commit protocol (b) of invariant 12 every earlier footer therefore stays in the file
+together with the index and chunks it names, so an interrupted append leaves the last committed
+generation intact below the partial tail.
+
+A reader MUST NOT fall back to an older generation. It reads the footer in the last 64 bytes only
+(section 9.1) and rejects the file when that footer or its layout is invalid. A tool MAY, on an
+explicit request, shorten a file to its latest valid generation by this procedure:
+
+1. If the file is valid as it is, nothing is done.
+2. Otherwise, for each offset `p` with `64 ≤ p ≤ file_len − 64` at which `end_magic` ends at `p + 64`,
+   from the end of the file backwards: take the prefix `0..p + 64` as the whole file and apply steps 1
+   to 4 of section 9.1 to it, with `file_len = p + 64`. The first prefix that passes is the latest
+   valid generation.
+3. Before shortening, the tool SHOULD decode every member of that prefix and check its BLAKE3 (step 6
+   of section 9.1). A prefix can pass step 2 while some of its chunks were overwritten by a write
+   outside invariant 12, such as an interrupted rewrite in place. A prefix that fails this check is
+   passed over, and the search of step 2 goes on to the next older offset.
+4. Truncate the file to `p + 64` and sync it. Nothing below `p + 64` is written.
+
+The tool MUST bound the number of candidates it checks and the bytes it scans, since a hostile file can
+hold many self-consistent footers, and MUST report exceeding a bound, or finding no candidate, as a
+failure.
+
 ## 10. Reserved for later versions
 
 These ids and bits are reserved and rejected. Their semantics are not defined here. Version 0.1
@@ -637,10 +683,6 @@ bit set and skips it otherwise.
 | Blob kind, derived | 2 |
 | Step ids, further delta operations | 0x0401 to 0x04FF |
 | Step ids, derived | 0x0500 to 0x05FF |
-
-Appending to a file needs no version change: new data follows the old index, then a new index and a
-footer with `generation + 1`, and the old index and footer become unreferenced bytes of the data
-region, which invariant 4 allows.
 
 ## 11. Writer policy
 

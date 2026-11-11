@@ -35,7 +35,7 @@ use ziptensors_core::format::{
 };
 use ziptensors_core::{
     Container, Dtype, ElementWidth, EncodeOptions, EncodeReport, Error, FieldTable, Layout, Member,
-    Mode, OpenOptions, PackBuilder, Profile, View, encode_file, layer_report,
+    Mode, OpenOptions, PackBuilder, Profile, View, check_member_names, encode_file, layer_report,
 };
 
 const MODES: [Mode; 3] = [Mode::Fast, Mode::Balanced, Mode::Max];
@@ -918,7 +918,27 @@ fn add_member_from_refuses_a_missing_member_and_keeps_going() {
     assert!(matches!(error, Error::MemberNotFound { .. }), "{error:?}");
     builder.add_member_from(&container, "source").expect("copies");
     let error = builder.add_member_from(&container, "source").expect_err("used twice");
-    assert!(matches!(error, Error::MalformedIndex { section: "MEMB", .. }), "{error:?}");
+    assert!(matches!(&error, Error::DuplicateMember { name } if name == "source"), "{error:?}");
+    builder.finish().expect("commits");
+}
+
+#[test]
+fn a_merge_of_containers_sharing_a_member_name_is_refused_before_the_output_starts() {
+    let scratch = Scratch::new();
+    let (first, _) = pack(&scratch, Mode::Max, &[("shared", b"one".as_slice()), ("a", b"a".as_slice())]);
+    let (second, _) = pack(&scratch, Mode::Fast, &[("b", b"b".as_slice()), ("shared", b"two".as_slice())]);
+    let sources = [first, second].map(|path| Container::open(&path, &OpenOptions::default()).expect("opens"));
+    let names = sources.iter().flat_map(|source| source.members().iter().map(|info| info.name.as_str()));
+    let error = check_member_names(names).expect_err("shared name");
+    assert!(matches!(&error, Error::DuplicateMember { name } if name == "shared"), "{error:?}");
+
+    // The builder refuses the same copy on its own, for a caller that did not check first.
+    let merged = scratch.path("merged");
+    let mut builder = PackBuilder::new(&merged, &options(Mode::Max)).expect("starts");
+    builder.add_member_from(&sources[0], "shared").expect("copies");
+    let error = builder.add_member_from(&sources[1], "shared").expect_err("used twice");
+    assert!(matches!(&error, Error::DuplicateMember { name } if name == "shared"), "{error:?}");
+    builder.add_member_from(&sources[1], "b").expect("the builder stays usable");
     builder.finish().expect("commits");
 }
 
@@ -1066,7 +1086,7 @@ fn member_names_a_restore_would_refuse_are_refused_here() {
     }
     builder.add_file(&input, "nested/ok").expect("adds");
     let error = builder.add_file(&input, "nested/ok").expect_err("used twice");
-    assert!(matches!(error, Error::MalformedIndex { section: "MEMB", .. }), "{error:?}");
+    assert!(matches!(&error, Error::DuplicateMember { name } if name == "nested/ok"), "{error:?}");
 }
 
 #[test]

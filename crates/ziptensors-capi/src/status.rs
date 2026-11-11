@@ -63,6 +63,23 @@ pub enum ZtStatus {
     /// synced afterwards, so a power loss may bring back the previous file. Every other failure of a
     /// call that writes a file leaves its output untouched. Unix only.
     CommittedNotDurable = 20,
+    /// An in-place edit failed after it began moving data: the container is damaged. Restore it from
+    /// a backup or repack it.
+    DamagedInPlace = 21,
+    /// An edit request cannot be applied as asked. Raised before anything is written: the container is
+    /// unchanged.
+    EditRefused = 22,
+    /// The file holds a valid container followed by bytes that could not be removed, so it does not
+    /// open as it is. Recovery truncates it to the valid length.
+    TrailingBytes = 23,
+    /// Recovery found no valid container in the file. Nothing was changed.
+    Unrecoverable = 24,
+    /// A tree operation found names that collide and refused the whole run. Nothing was written.
+    TreeConflict = 25,
+    /// A write would store two members under one name, for example a file added to a pack under a
+    /// name the pack already has. That member was not added. A container whose index holds a name
+    /// twice is damaged instead, `ZT_STATUS_MALFORMED_INDEX`.
+    DuplicateMember = 26,
     /// A required pointer was NULL.
     NullArgument = -1,
     /// A string argument is not valid UTF-8.
@@ -73,7 +90,8 @@ pub enum ZtStatus {
     /// `struct_size` of an options struct is not the size this library knows: the caller was built
     /// against another header.
     StructSize = -4,
-    /// The handle cannot do this any more: a `zt_pack` that was finished, or that panicked.
+    /// The call cannot be done in this state: a `zt_pack` that was finished, or that panicked;
+    /// `zt_enable_stderr_logging` in a process where something else already set the global logger.
     InvalidState = -5,
     /// The library panicked. The call did not complete, and handles it used should be closed.
     Panic = -6,
@@ -105,6 +123,12 @@ impl ZtStatus {
             ErrorCode::SymlinkInput => Self::SymlinkInput,
             ErrorCode::OutputIsInput => Self::OutputIsInput,
             ErrorCode::CommittedNotDurable => Self::CommittedNotDurable,
+            ErrorCode::DamagedInPlace => Self::DamagedInPlace,
+            ErrorCode::EditRefused => Self::EditRefused,
+            ErrorCode::TrailingBytes => Self::TrailingBytes,
+            ErrorCode::Unrecoverable => Self::Unrecoverable,
+            ErrorCode::TreeConflict => Self::TreeConflict,
+            ErrorCode::DuplicateMember => Self::DuplicateMember,
         }
     }
 }
@@ -154,6 +178,15 @@ pub(crate) enum Failure {
         /// What happened to the handle.
         detail: &'static str,
     },
+
+    /// An element of the operation array of `zt_edit` was refused. The status is the element's.
+    #[error("operation {index}: {inner}")]
+    Op {
+        /// Position in the array.
+        index: usize,
+        /// Why the element was refused.
+        inner: Box<Failure>,
+    },
 }
 
 impl Failure {
@@ -167,6 +200,7 @@ impl Failure {
             Self::Invalid { .. } => ZtStatus::InvalidArgument,
             Self::StructSize { .. } => ZtStatus::StructSize,
             Self::State { .. } => ZtStatus::InvalidState,
+            Self::Op { inner, .. } => inner.status(),
         }
     }
 }

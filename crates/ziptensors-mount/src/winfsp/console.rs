@@ -2,7 +2,8 @@
 //! Purpose: Ctrl-C and Ctrl-Break for a foreground `WinFsp` mount: the console control handler, the
 //! events a foreground mount waits for, and the decision each event takes.
 //!
-//! Key structures: [`UnmountSignals`], [`ConsoleEvent`], [`MountEnd`], `Wake`, `Watch`, `Action`.
+//! Key structures: [`UnmountSignals`], [`ConsoleEvent`], `Wake`, `Watch`, `Action`. How a mount ended
+//! is the backend-neutral `MountEnd` of `handle.rs`.
 //!
 //! Key functions: [`UnmountSignals::install`], `step`.
 //!
@@ -28,14 +29,11 @@ use windows_sys::core::BOOL;
 /// The listener of the console handler, set once per process by [`UnmountSignals::install`].
 static LISTENER: OnceLock<Sender<Wake>> = OnceLock::new();
 
-/// Exit status of a mount the driver stopped: the CLI's runtime failure.
-const EXIT_STOPPED: u8 = 1;
+/// The C runtime's `SIGINT`, which it raises for Ctrl-C.
+const SIGNAL_CTRL_C: i32 = 2;
 
-/// Exit status of a mount abandoned by a second Ctrl-C: 128 + `SIGINT`, as a shell reports it.
-const EXIT_CTRL_C: u8 = 130;
-
-/// Exit status of a mount abandoned by a second Ctrl-Break: 128 + `SIGBREAK` (21) of the C runtime.
-const EXIT_CTRL_BREAK: u8 = 149;
+/// The C runtime's `SIGBREAK`, which it raises for Ctrl-Break.
+const SIGNAL_CTRL_BREAK: i32 = 21;
 
 /// A console event that ends a foreground mount.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,39 +53,24 @@ impl ConsoleEvent {
             Self::CtrlBreak => "Ctrl-Break",
         }
     }
-}
 
-/// How a foreground mount ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MountEnd {
-    /// Unmounted by a console event, after every file that was open under it was closed and unmapped.
-    Unmounted,
-    /// The driver stopped the volume on its own: a dispatcher thread failed (for example could not be
-    /// created) or `WinFsp` was uninstalled. A failure, not an unmount; the caller should report it and
-    /// exit with [`MountEnd::exit_code`], 1.
-    Stopped {
-        /// The status the dispatcher ended with, 0 if `WinFsp` recorded none.
-        status: i32,
-    },
-    /// A second console event came while files were still open. The volume is left serving them and
-    /// the caller should end the process now, with [`MountEnd::exit_code`], which cuts the readers off.
-    Abandoned {
-        /// The second event.
-        event: ConsoleEvent,
-    },
-}
-
-impl MountEnd {
-    /// The exit status for this end: 0, 1 for a volume the driver stopped (a runtime failure), 130
-    /// after a second Ctrl-C, 149 after a second Ctrl-Break (128 + the C runtime's signal number, as on
-    /// Linux).
+    /// The C runtime's signal number of the key (`SIGINT` 2, `SIGBREAK` 21), the `signal` of
+    /// `MountEnd::Abandoned`, so the exit status is 128 + it as on Linux (130, 149).
     #[must_use]
-    pub fn exit_code(self) -> u8 {
+    pub fn signal(self) -> i32 {
         match self {
-            Self::Unmounted => 0,
-            Self::Stopped { .. } => EXIT_STOPPED,
-            Self::Abandoned { event: ConsoleEvent::CtrlC } => EXIT_CTRL_C,
-            Self::Abandoned { event: ConsoleEvent::CtrlBreak } => EXIT_CTRL_BREAK,
+            Self::CtrlC => SIGNAL_CTRL_C,
+            Self::CtrlBreak => SIGNAL_CTRL_BREAK,
+        }
+    }
+
+    /// The key whose C runtime signal number is `signal`, if any.
+    #[must_use]
+    pub fn from_signal(signal: i32) -> Option<Self> {
+        match signal {
+            SIGNAL_CTRL_C => Some(Self::CtrlC),
+            SIGNAL_CTRL_BREAK => Some(Self::CtrlBreak),
+            _ => None,
         }
     }
 }
@@ -119,14 +102,14 @@ pub(super) enum Watch {
 pub(super) enum Action {
     /// Remove the mount point, then end at once if no file is open.
     Detach,
-    /// End with [`MountEnd::Unmounted`] if still no file is open (one may have been opened since the
+    /// End with [`crate::MountEnd::Unmounted`] if still no file is open (one may have been opened since the
     /// wake-up was sent), else keep waiting.
     Finish,
-    /// End with [`MountEnd::Stopped`].
+    /// End with [`crate::MountEnd::Stopped`].
     DriverStopped,
     /// Reopen and close the files still counted open, so a deferred Close arrives (`poke.rs`).
     Poke,
-    /// Leave the volume running and return [`MountEnd::Abandoned`].
+    /// Leave the volume running and return [`crate::MountEnd::Abandoned`].
     Abandon(ConsoleEvent),
     /// Nothing: a wake-up that does not apply in this state.
     Ignore,
@@ -216,7 +199,7 @@ unsafe extern "system" fn handler(event: u32) -> BOOL {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, ConsoleEvent, MountEnd, Wake, Watch, step};
+    use super::{Action, ConsoleEvent, Wake, Watch, step};
 
     #[test]
     fn the_first_key_detaches_the_second_abandons_and_closed_files_finish() {
@@ -235,11 +218,11 @@ mod tests {
     }
 
     #[test]
-    fn exit_codes_follow_the_shell_convention() {
-        assert_eq!(MountEnd::Unmounted.exit_code(), 0);
-        assert_eq!(MountEnd::Stopped { status: -1 }.exit_code(), 1);
-        assert_eq!(MountEnd::Abandoned { event: ConsoleEvent::CtrlC }.exit_code(), 130);
-        assert_eq!(MountEnd::Abandoned { event: ConsoleEvent::CtrlBreak }.exit_code(), 149);
+    fn keys_carry_the_c_runtime_signal_numbers() {
+        assert_eq!(ConsoleEvent::CtrlC.signal(), 2);
+        assert_eq!(ConsoleEvent::CtrlBreak.signal(), 21);
+        assert_eq!(ConsoleEvent::from_signal(21), Some(ConsoleEvent::CtrlBreak));
+        assert_eq!(ConsoleEvent::from_signal(15), None);
         assert_eq!(ConsoleEvent::CtrlBreak.as_str(), "Ctrl-Break");
     }
 }

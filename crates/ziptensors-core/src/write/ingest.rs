@@ -1,5 +1,5 @@
 //! File: write/ingest.rs
-//! Purpose: the streaming pipeline that turns one source file into blobs and extents.
+//! Purpose: the streaming pipeline that turns one input into blobs and extents.
 //!
 //! Main responsibilities:
 //! - cut the file into segments: typed ranges of the plan, and skeleton fragments between them;
@@ -11,9 +11,13 @@
 //!
 //! Key functions: [`ingest`].
 //!
-//! Implementation notes: the calling thread is the one reader. A chunk goes to the pool with a one-shot
-//! channel for its result, and that channel's receiver enters an ordered `sync_channel`, so the writer
-//! thread takes results in submission order with no reorder buffer, whatever order they finish in.
+//! Implementation notes: an input is any [`RandomAccess`]: a source file, or a source that is no file
+//! (a member of an open container, read through its decoder). Nothing here depends on which; the
+//! builder owns stamps and the meaning of a change.
+//!
+//! The calling thread is the one reader. A chunk goes to the pool with a one-shot channel for its
+//! result, and that channel's receiver enters an ordered `sync_channel`, so the writer thread takes
+//! results in submission order with no reorder buffer, whatever order they finish in.
 //!
 //! The window is 2 × threads chunks, counting the one the reader is filling and the one the writer
 //! holds, hence a channel of 2 × threads − 2. A chunk in the window is one buffer of at most a chunk,
@@ -24,7 +28,7 @@
 //! to the stored bytes of the same chunks.
 //!
 //! A delta blob (spec section 7a) streams its base chunk beside each raw chunk, read by the same
-//! thread from the base's own source file, so a chunk in the window holds two buffers until it is
+//! thread from the base's own source, so a chunk in the window holds two buffers until it is
 //! encoded, and a workspace keeps one more, the residual. That is 2 × threads chunks of two buffers,
 //! `threads` stored buffers of the chunks in compression, and `threads` workspaces of at most 3.95
 //! chunks: 9 × threads × chunk. Workspaces keep their buffers, so the bound holds for the rest of a
@@ -45,6 +49,7 @@
 //! duplicate of the base blob, and its delta chunks are rolled back.
 
 use std::borrow::Cow;
+use std::fmt;
 use std::path::Path;
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -58,7 +63,7 @@ use crate::codec::{
 };
 use crate::error::Error;
 use crate::format::{BlobRecord, ChunkRecord, DeltaParams, ExtentRecord, IndexBuilder};
-use crate::io::{FileSource, RandomAccess};
+use crate::io::RandomAccess;
 use crate::types::{Dtype, Mode, TypedRange};
 
 use super::commit::Sink;
@@ -427,13 +432,23 @@ pub(super) struct IngestContext<'a> {
 
 /// The base of a file stored with delta blobs: where to read base bytes, and which base range each
 /// typed range of the file was paired with.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub(super) struct DeltaInput<'a> {
-    /// The base member's source file, read again for its canonical bytes. A change since it was added
-    /// is caught by its stamp and by the commit's decode.
-    pub(super) source: &'a FileSource,
+    /// The base member's bytes, read again for its canonical bytes: its source file reopened, or the
+    /// source it was added from. A change since it was added is caught by its stamp, where it has
+    /// one, and always by the commit's decode.
+    pub(super) source: &'a dyn RandomAccess,
     /// One entry per typed range of the file, in order.
     pub(super) bases: &'a [Option<BaseRange>],
+}
+
+impl fmt::Debug for DeltaInput<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeltaInput")
+            .field("source_len", &self.source.len())
+            .field("bases", &self.bases)
+            .finish()
+    }
 }
 
 /// Why a delta blob of `len` bytes and `chunk_size` cannot rest on `range` of a blob of shape `base`,
@@ -463,9 +478,10 @@ fn base_refusal(
 }
 
 /// The reader's side of the pipeline.
-#[derive(Debug)]
 struct Reader<'a, 'c> {
-    source: &'a FileSource,
+    source: &'a dyn RandomAccess,
+    /// Names the input in messages; see [`ingest`].
+    path: &'a Path,
     context: IngestContext<'c>,
     commands: SyncSender<Command>,
     /// BLAKE3 of the file up to the read position.
@@ -480,8 +496,25 @@ struct Reader<'a, 'c> {
     delta_blobs: u32,
 }
 
-/// Reads `buf` from `source`. A short read is a file that shrank under us.
-fn read_from(source: &FileSource, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
+impl fmt::Debug for Reader<'_, '_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Reader")
+            .field("source_len", &self.source.len())
+            .field("path", &self.path)
+            .field("context", &self.context)
+            .field("extents", &self.extents.len())
+            .field("blobs_added", &self.blobs_added)
+            .field("blobs_reused", &self.blobs_reused)
+            .field("widen_restreams", &self.widen_restreams)
+            .field("delta_blobs", &self.delta_blobs)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reads `buf` from `source`. A short read is an input that shrank under us: an [`Error::Io`] of kind
+/// `UnexpectedEof` becomes [`Error::InputChanged`] with the path that error names, and every other
+/// error passes through.
+fn read_from(source: &dyn RandomAccess, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
     source.read_exact_at(offset, buf).map_err(|error| match error {
         Error::Io { source, path, .. } if source.kind() == std::io::ErrorKind::UnexpectedEof => {
             Error::InputChanged { path }
@@ -496,10 +529,10 @@ impl Reader<'_, '_> {
         read_from(self.source, offset, buf)
     }
 
-    /// Reads `buf` from the base file at `offset`.
+    /// Reads `buf` from the base source at `offset`.
     fn read_base(&self, offset: u64, buf: &mut [u8]) -> Result<(), Error> {
         let delta = self.context.delta.ok_or_else(|| {
-            plumbing("read base", self.source.path(), "a delta blob without a base file")
+            plumbing("read base", self.path, "a delta blob without a base file")
         })?;
         read_from(delta.source, offset, buf)
     }
@@ -508,13 +541,13 @@ impl Reader<'_, '_> {
     fn send(&self, command: Command) -> Result<(), Error> {
         self.commands
             .send(command)
-            .map_err(|_| plumbing("write", self.source.path(), "the writer stopped"))
+            .map_err(|_| plumbing("write", self.path, "the writer stopped"))
     }
 
     /// Reads the first [`SAMPLE_BYTES`] of `segment`, or all of it, a whole number of `align` long.
     fn sample(&self, segment: &Segment, align: u64) -> Result<Vec<u8>, Error> {
         let len = segment.len.min(SAMPLE_BYTES) / align * align;
-        let mut sample = vec![0; to_usize(len, self.source.path())?];
+        let mut sample = vec![0; to_usize(len, self.path)?];
         self.read(segment.offset, &mut sample)?;
         Ok(sample)
     }
@@ -579,7 +612,7 @@ impl Reader<'_, '_> {
         let shape = self.context.blobs.shape(base.blob);
         if let Some(reason) = base_refusal(shape, base, segment.len, delta.chunk_size) {
             tracing::debug!(
-                path = %self.source.path().display(),
+                path = %self.path.display(),
                 offset = segment.offset,
                 base_blob = base.blob,
                 reason,
@@ -638,7 +671,7 @@ impl Reader<'_, '_> {
             }
         }
         let (_, encoding, base) = best.ok_or_else(|| {
-            plumbing("pick encoding", self.source.path(), "no candidate encoding")
+            plumbing("pick encoding", self.path, "no candidate encoding")
         })?;
         Ok((encoding, base))
     }
@@ -684,7 +717,7 @@ impl Reader<'_, '_> {
         let mut sent_any = false;
         loop {
             let len = chunk_size.min(canonical_len - done);
-            let mut raw = vec![0; to_usize(len, self.source.path())?];
+            let mut raw = vec![0; to_usize(len, self.path)?];
             let offset = segment.offset + done * factor;
             if view == View::Identity {
                 self.read(offset, &mut raw)?;
@@ -716,7 +749,7 @@ impl Reader<'_, '_> {
             self.send(Command::Chunk(self.context.compressor.submit(raw, base_bytes, encoding)))?;
             let id = *self.context.next_blob;
             *self.context.next_blob = id.checked_add(1).ok_or_else(|| {
-                plumbing("seal blob", self.source.path(), "too many blobs for a u32 id")
+                plumbing("seal blob", self.path, "too many blobs for a u32 id")
             })?;
             let delta = base.map(|base| DeltaParams {
                 base_blob: base.blob,
@@ -754,7 +787,7 @@ impl Reader<'_, '_> {
             return Ok(None);
         };
         let offset = base.file_offset.checked_add(at).ok_or_else(|| {
-            plumbing("read base", self.source.path(), "a base offset past 2^64")
+            plumbing("read base", self.path, "a base offset past 2^64")
         })?;
         let mut bytes = vec![0; len];
         self.read_base(offset, &mut bytes)?;
@@ -801,7 +834,7 @@ impl Reader<'_, '_> {
                 }
                 Streamed::NotExact => {
                     tracing::debug!(
-                        path = %self.source.path().display(),
+                        path = %self.path.display(),
                         offset = segment.offset,
                         "late widening mismatch, streaming the range again"
                     );
@@ -829,7 +862,7 @@ impl Reader<'_, '_> {
             Streamed::NotExact => {
                 return Err(plumbing(
                     "stream blob",
-                    self.source.path(),
+                    self.path,
                     "an identity view found an inexact element",
                 ));
             }
@@ -896,16 +929,20 @@ fn to_usize(len: u64, path: &Path) -> Result<usize, Error> {
 }
 
 /// Streams `source` into the pack: `ranges` are its normalized typed ranges, and `context.delta`, if
-/// set, has one base entry per range.
+/// set, has one base entry per range. `path` names the input in log fields and in the errors of the
+/// pipeline's own plumbing (the file's path, or what the caller calls a source that is no file);
+/// errors of a read carry the path the source itself reports.
 ///
 /// On `Err` from reading, the pack stays usable: blobs already sealed stay as unreferenced records, an
 /// open blob is rolled back, and `sink` and `index` agree. On `Err` from writing, `sink` is poisoned.
 ///
 /// # Errors
-/// [`Error::InputChanged`] if the file or the base file shrinks under the read, [`Error::Io`] for a
-/// failed read or write, [`Error::Zstd`] if compression fails.
+/// [`Error::InputChanged`] if the input or the base source shrinks under the read, [`Error::Io`] for a
+/// failed read or write, [`Error::Zstd`] if compression fails, and any other error a source's read
+/// returns (a member source reports damage of its container this way).
 pub(super) fn ingest(
-    source: &FileSource,
+    source: &dyn RandomAccess,
+    path: &Path,
     ranges: &[TypedRange],
     context: IngestContext<'_>,
     sink: &mut Sink,
@@ -914,10 +951,10 @@ pub(super) fn ingest(
     let bases = context.delta.map_or(&[][..], |delta| delta.bases);
     let parts = segments(ranges, bases, source.len());
     let compressor = context.compressor;
-    let path = source.path();
     let (commands, received) = mpsc::sync_channel(compressor.channel_capacity());
     let reader = Reader {
         source,
+        path,
         context,
         commands,
         hasher: blake3::Hasher::new(),

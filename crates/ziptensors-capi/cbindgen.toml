@@ -14,8 +14,8 @@ sys_includes = ["stddef.h", "stdint.h"]
 line_length = 100
 
 [export]
-# These two appear in option structs as raw `int32_t`, so no function signature reaches them.
-include = ["ZtMode", "ZtVerify"]
+# These appear in option structs or parameters as raw integers, so no signature reaches them.
+include = ["ZtMode", "ZtVerify", "ZtStrategy", "ZtLogLevel"]
 
 [export.rename]
 ZtStatus = "zt_status"
@@ -27,6 +27,12 @@ ZtPack = "zt_pack"
 ZtOpenOptions = "zt_open_options"
 ZtEncodeOptions = "zt_encode_options"
 ZtTensorDesc = "zt_tensor_desc"
+ZtMemberDesc = "zt_member_desc"
+ZtStrategy = "zt_strategy"
+ZtLogLevel = "zt_log_level"
+ZtEditOp = "zt_edit_op"
+ZtEditOptions = "zt_edit_options"
+ZtRecoverOptions = "zt_recover_options"
 
 [enum]
 prefix_with_name = true

@@ -1,5 +1,5 @@
 //! File: fuzz/src/bin/make_seeds.rs
-//! Purpose: writes the seed corpus of the three targets, so that no corpus lives in the tree.
+//! Purpose: writes the seed corpus of the four targets, so that no corpus lives in the tree.
 //!
 //! Implementation notes: takes the output directory as its one argument and creates
 //! `<dir>/<target>/`. Seeds are generated, the same on every run. Profile seeds come from the
@@ -14,8 +14,10 @@ mod fixtures;
 
 use fixtures::{Elem, GgufOptions, OnnxModel, OnnxTensor, PtZipOptions, TensorSpec};
 use ziptensors_fuzz::harness::{
-    PLAIN_CHAINS, chain_table, delta_sample, one_plane_body, sample, to_fixed_up_input,
+    PLAIN_CHAINS, append_generation, chain_table, delta_sample, one_plane_body, required_features,
+    sample, split_file, to_fixed_up_input,
 };
+use ziptensors_core::chain::FEATURE_DELTA;
 
 /// Bytes after the four control bytes of a `decode_chunk` seed.
 const CHUNK_BODY: usize = 2048;
@@ -31,15 +33,48 @@ fn write_all(dir: &Path, seeds: &[Vec<u8>]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Seeds of `open_and_read`: the sample and the delta sample in both input forms, for a few seeds.
+/// The containers every container seed starts from: four samples and two delta samples.
+fn containers() -> Vec<Vec<u8>> {
+    (0..6).map(|seed| if seed < 4 { sample(seed).file } else { delta_sample(seed).file }).collect()
+}
+
+/// Seeds of `open_and_read`: the sample and the delta sample in both input forms, for a few seeds,
+/// and each with a second generation appended, as file bytes (the fixed-up form has one generation).
 fn container_seeds() -> Vec<Vec<u8>> {
     let mut seeds = Vec::new();
-    for seed in 0..6 {
-        let file = if seed < 4 { sample(seed).file } else { delta_sample(seed).file };
+    for file in containers() {
         seeds.push(to_fixed_up_input(&file));
         seeds.push([&[0], file.as_slice()].concat());
+        seeds.push([&[0], append_generation(&file).as_slice()].concat());
     }
     seeds
+}
+
+/// Seeds of `recover_scan`, each container: two generations as file bytes, whole and torn in the
+/// second's index and footer; and in the fixed-up form, with the delta feature bit where the file
+/// needs it, with no tail, a garbage tail, and a second generation as the tail. The top four bits of
+/// each form byte vary the tight budget.
+fn recover_seeds() -> Result<Vec<Vec<u8>>, Box<dyn Error>> {
+    let mut seeds = Vec::new();
+    for (id, file) in containers().iter().enumerate() {
+        let budget = u8::try_from(id % 16).unwrap_or(0) << 4;
+        let two = append_generation(file);
+        let added = two.len() - file.len();
+        for cut in [0, 1, added / 2, added - 64, added - 32, added - 1] {
+            seeds.push([&[budget], &two[..two.len() - cut]].concat());
+        }
+        let (data, raw_index) = split_file(file);
+        let delta = if required_features(file) & FEATURE_DELTA == 0 { 0 } else { 2 };
+        let mut fixed = vec![budget | delta | 1];
+        fixed.extend_from_slice(&u32::try_from(data.len())?.to_le_bytes());
+        fixed.extend_from_slice(&u32::try_from(raw_index.len())?.to_le_bytes());
+        fixed.extend_from_slice(&data);
+        fixed.extend_from_slice(&raw_index);
+        seeds.push(fixed.clone());
+        seeds.push([fixed.as_slice(), &[0x5A; 200]].concat());
+        seeds.push([fixed.as_slice(), &two[file.len()..]].concat());
+    }
+    Ok(seeds)
 }
 
 /// Seeds of `decode_chunk`: every chain, form and policy over one patterned body, delta chains with
@@ -95,5 +130,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_all(&root.join("open_and_read"), &container_seeds())?;
     write_all(&root.join("decode_chunk"), &chunk_seeds())?;
     write_all(&root.join("profile_scan"), &profile_seeds())?;
+    write_all(&root.join("recover_scan"), &recover_seeds()?)?;
     Ok(())
 }

@@ -19,10 +19,12 @@ The reader's flow, in spec section 9.1 order:
    `CHST`. A reader resolves a delta blob's base with `Index::delta_params` per extent segment it reads.
 4. `check_decode_budget` before any data read, `check_restore_name` before a restore joins a path.
 
-The writer's flow is `IndexBuilder`, `serialize`, compression by the caller, `Footer::for_index`,
-`Footer::to_bytes`, with `Header::current` and `Header::to_bytes` at the start of the file. A writer
-of delta blobs adds each `DeltaParams::encode` with `IndexBuilder::add_params` and sets
-`FEATURE_DELTA` in the header it finally writes.
+The writer's flow is `IndexBuilder`, `serialize`, compression by the caller, `Footer::for_index` with
+the file's `generation`, `Footer::to_bytes`, with `Header::current` and `Header::to_bytes` at the start of
+the file. A writer of delta blobs adds each `DeltaParams::encode` with `IndexBuilder::add_params` and sets
+`FEATURE_DELTA` in the header it finally writes. An edit that keeps the blobs of a container starts from
+`IndexBuilder::seed` over its validated index instead of `IndexBuilder::new`; one that drops blobs and
+moves the rest starts from `IndexBuilder::seed_subset`.
 
 ## Files and submodules
 
@@ -35,7 +37,7 @@ of delta blobs adds each `DeltaParams::encode` with `IndexBuilder::add_params` a
 | `index.rs` | Section table rules, record arrays, the `PARM` heap, bounded accessors. |
 | `validate.rs` | Invariants across records, the decode budget, restore name safety. |
 | `validate_tests.rs` | Reject tests per invariant, cost and hostile-input tests. |
-| `builder.rs` | Serialization of an index. |
+| `builder.rs` | Serialization of an index; seeds from an existing index (`seed`, `seed_subset`). |
 | `wire.rs` | Field access at compile-time-checked offsets, error constructor. |
 | `testkit.rs` | Test-only fixtures. |
 
@@ -69,6 +71,19 @@ of delta blobs adds each `DeltaParams::encode` with `IndexBuilder::add_params` a
   the bound.
 - `IndexBuilder` enforces no invariant, by design: writers prove the result by parsing it, and hostile
   fixtures are built through it. The serialized layout is deterministic.
+- `IndexBuilder::seed` re-adds `CHST`, `CHAN`, `BLOB`, `CHNK` and the `PARM` entry of each delta blob of a
+  validated index, in id order, and checks that every record keeps its id, so extents and `PARM` base ids
+  of the source stay valid. Chunk offsets go through the caller's `rebase` closure (identity when the data
+  region stays, a move map otherwise). It carries every blob, referenced or not; strings, members,
+  extents, tensors and shapes are the caller's.
+- `IndexBuilder::seed_subset(index, kept, rebase)` (crate-private, for an in-place rewrite) carries every
+  `CHST`/`CHAN` record with its id but only the blobs `kept`, renumbered `0..` in increasing old id, so a
+  delta blob's base keeps a lower id (invariant 13) and its `PARM` entry names the base's new id; a kept
+  delta blob without its base is refused. Each kept blob's chunks follow the previous blob's, rebased by
+  `rebase(&ChunkRecord)`; blobs that shared chunk records get equal copies (invariant 4 allows that). It
+  returns the old-to-new id map for the caller's extents.
+- `Footer::generation` is informational: `GENERATION_INITIAL` (1) for a fresh file, the previous value
+  plus one for an edit. No value is rejected.
 
 ## Editing map
 

@@ -25,6 +25,13 @@ crate-type = ["cdylib", "rlib"]
 ziptensors-core.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# Only for `zt_enable_stderr_logging`; nothing is installed unless a host calls it.
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
 cbindgen.workspace = true
+# The hash `zt_member_info` must state, computed independently of core.
+blake3.workspace = true
+# Builds an index by hand for a container with a member name a restore refuses, which no writer
+# produces.
+zstd.workspace = true

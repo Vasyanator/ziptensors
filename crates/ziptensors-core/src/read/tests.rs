@@ -722,7 +722,9 @@ fn with_stored_index(file: &[u8], stored: &[u8], raw: &[u8]) -> Vec<u8> {
     let offset = footer_of(file).index_offset;
     let mut rebuilt = file[..len_of(offset)].to_vec();
     rebuilt.extend_from_slice(stored);
-    rebuilt.extend_from_slice(&Footer::for_index(offset, stored.len() as u64, raw).to_bytes());
+    let generation = crate::format::GENERATION_INITIAL;
+    let footer = Footer::for_index(offset, stored.len() as u64, raw, generation);
+    rebuilt.extend_from_slice(&footer.to_bytes());
     rebuilt
 }
 
@@ -830,7 +832,8 @@ fn a_stored_index_longer_than_zstd_could_write_is_refused_before_it_is_read() {
     let mut padded = file[..len_of(index)].to_vec();
     padded.resize(padded.len() + (1 << 20), 0);
     let stored_len = (padded.len() as u64) - index;
-    padded.extend_from_slice(&Footer::for_index(index, stored_len, &raw).to_bytes());
+    let generation = crate::format::GENERATION_INITIAL;
+    padded.extend_from_slice(&Footer::for_index(index, stored_len, &raw, generation).to_bytes());
     assert!(padded.len() > source_len);
     let error = open_with(padded, &options(1));
     assert!(matches!(error, Err(Error::BudgetExceeded { what: "stored index", .. })), "{error:?}");

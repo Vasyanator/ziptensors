@@ -12,8 +12,9 @@
 //! Implementation notes: ids are assigned breadth first from the root (1), each directory's entries in
 //! name order, so the same container always gets the same ids and an id is never reused while the
 //! tree lives. Two entries of one directory are the same entry when their policy keys are equal: the
-//! name itself under POSIX, the case-folded name under Windows. Directories exist only as prefixes of
-//! member names; an empty directory cannot be expressed in a container.
+//! name itself under POSIX, the case-folded name under Windows. In a container mount directories exist
+//! only as prefixes of member names, since a container cannot express an empty directory; an overlay
+//! also lists every directory on disk (`Tree::build_with_dirs`).
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -71,11 +72,11 @@ pub enum Node {
         /// Its entries, sorted by name (byte order).
         entries: Vec<DirEntry>,
     },
-    /// A file: one member of the container.
+    /// A file: one member of the container, or one file of an overlay.
     File {
         /// Its directory.
         parent: NodeId,
-        /// Index of the member in `Container::members` (file order).
+        /// Index of the member in `Container::members` (file order), or of the file in the overlay.
         member: usize,
         /// Length of the member in bytes.
         len: u64,
@@ -184,8 +185,32 @@ impl Tree {
         P: NamePolicy + 'static,
         I: IntoIterator<Item = (&'a str, u64)>,
     {
+        Self::build_with_dirs(members, std::iter::empty(), policy)
+    }
+
+    /// [`Tree::build`], plus the directories `dirs` (`/`-separated paths), which exist even when no
+    /// file lies under them: a directory tree on disk has empty directories, a container does not.
+    /// Files keep their index in `members` alone.
+    ///
+    /// # Errors
+    /// As [`Tree::build`], with a directory checked like a member name: a refused name, two directories
+    /// that are one under `policy`, a file at the path of a directory.
+    pub(crate) fn build_with_dirs<'a, 'd, P, I, D>(members: I, dirs: D, policy: P) -> Result<Self, TreeError>
+    where
+        P: NamePolicy + 'static,
+        I: IntoIterator<Item = (&'a str, u64)>,
+        D: IntoIterator<Item = &'d str>,
+    {
         let mut drafts = vec![Draft::Dir { name: String::new(), children: BTreeMap::new(), first: String::new() }];
         let mut bad = Vec::new();
+        // Directories first: a file inserted later at a directory's path is then the one reported.
+        for name in dirs {
+            if let Err(problem) = check_name(&policy, name) {
+                bad.push(BadName { member: name.to_owned(), problem });
+                continue;
+            }
+            insert_dir(&mut drafts, &policy, name, &mut bad);
+        }
         for (member, (name, len)) in members.into_iter().enumerate() {
             if let Err(problem) = check_name(&policy, name) {
                 bad.push(BadName { member: name.to_owned(), problem });
@@ -370,6 +395,44 @@ fn insert(
     }
 }
 
+/// Adds directory `name` and every directory above it to the draft. A part that is a file, or a
+/// directory spelled differently but equal under `policy`, goes to `bad` and adds nothing below it.
+fn insert_dir(drafts: &mut Vec<Draft>, policy: &dyn NamePolicy, name: &str, bad: &mut Vec<BadName>) {
+    let mut dir = 0;
+    for part in name.split('/') {
+        let key = policy.key(part).into_owned();
+        let existing = match &drafts[dir] {
+            Draft::Dir { children, .. } => children.get(&key).copied(),
+            // `dir` only ever moves to a directory draft.
+            Draft::File { .. } => return,
+        };
+        let Some(found) = existing else {
+            let index = drafts.len();
+            drafts.push(Draft::Dir { name: part.to_owned(), children: BTreeMap::new(), first: name.to_owned() });
+            if let Draft::Dir { children, .. } = &mut drafts[dir] {
+                children.insert(key, index);
+            }
+            dir = index;
+            continue;
+        };
+        match &drafts[found] {
+            Draft::Dir { name: existing_name, first, .. } => {
+                if existing_name != part {
+                    let problem = NameProblem::Collision { with: first.clone() };
+                    bad.push(BadName { member: name.to_owned(), problem });
+                    return;
+                }
+                dir = found;
+            }
+            Draft::File { member_name, .. } => {
+                let problem = NameProblem::Collision { with: member_name.clone() };
+                bad.push(BadName { member: name.to_owned(), problem });
+                return;
+            }
+        }
+    }
+}
+
 /// Name of a draft node in its directory.
 fn draft_name(draft: &Draft) -> &str {
     match draft {
@@ -494,6 +557,34 @@ mod tests {
         );
         let deeper = Tree::build(members(&["m/n", "m/n/o/p"]), PosixPolicy).expect_err("conflict");
         assert_eq!(deeper.bad, [bad("m/n", NameProblem::FileIsDirectory { under: "m/n/o/p".to_owned() })]);
+    }
+
+    #[test]
+    fn listed_directories_exist_even_when_empty() {
+        let tree = Tree::build_with_dirs(members(&["a/x.bin"]), ["a", "e", "a/f/g"], PosixPolicy).expect("valid");
+        assert_eq!(names(&tree, NodeId::ROOT), ["a", "e"]);
+        let a = tree.lookup(NodeId::ROOT, "a").expect("a");
+        assert_eq!(names(&tree, a), ["f", "x.bin"]);
+        let g = tree.lookup(tree.lookup(a, "f").expect("f"), "g").expect("g");
+        assert_eq!(tree.entries(g).map(<[_]>::len), Some(0));
+        assert_eq!(tree.file_count(), 1);
+        assert_eq!(tree.lookup(a, "x.bin").and_then(|x| tree.node(x)).map(Node::kind), Some(NodeKind::File));
+    }
+
+    #[test]
+    fn a_listed_directory_conflicts_with_a_file_and_a_case_variant() {
+        let error = Tree::build_with_dirs(members(&["d"]), ["d"], PosixPolicy).expect_err("file at a directory");
+        assert_eq!(error.bad, [bad("d", NameProblem::FileIsDirectory { under: "d".to_owned() })]);
+        let error = Tree::build_with_dirs(members(&["A"]), ["a", "B", "b/c", "nul"], WindowsPolicy::default())
+            .expect_err("collisions");
+        assert_eq!(
+            error.bad,
+            [
+                bad("A", NameProblem::FileIsDirectory { under: "a".to_owned() }),
+                bad("b/c", NameProblem::Collision { with: "B".to_owned() }),
+                bad("nul", NameProblem::Reserved),
+            ]
+        );
     }
 
     #[test]

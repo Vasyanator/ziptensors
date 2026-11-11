@@ -8,6 +8,11 @@ Most users want the `ziptensors mount` command of
 [`ziptensors-cli`](https://crates.io/crates/ziptensors-cli). This crate is the library behind it: build a
 `MountFs` over a `ziptensors_core::ReadCache` and hand it to the backend of your OS.
 
+`MountFs::overlay` instead shows a whole directory read-only: each per-file container (one member,
+written beside its original by `ziptensors_core::compress_tree`) appears under its original file name
+with the decoded bytes, and every other file passes through unchanged. Containers open lazily, a bounded
+number at a time. A damaged container or two containers presenting one name refuse the mount.
+
 ## Platforms
 
 - **Linux:** FUSE through the pure-Rust `fuser` crate. Needs `/dev/fuse` and `fusermount3`; no libfuse.

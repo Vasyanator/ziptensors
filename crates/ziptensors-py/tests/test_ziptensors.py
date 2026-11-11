@@ -18,6 +18,7 @@ import array
 import ast
 import ctypes
 from collections.abc import Callable
+import inspect
 import json
 import logging
 import os
@@ -38,6 +39,7 @@ from ziptensors import (
     InputError,
     NotDurableError,
     NotFoundError,
+    PackBuilder,
     RangeError,
     UnsupportedError,
     ZiptensorsError,
@@ -61,6 +63,7 @@ CODE_TENSOR_NOT_FOUND = 12
 CODE_MEMBER_NOT_FOUND = 13
 CODE_UNSAFE_MEMBER_NAME = 14
 CODE_SYMLINK_INPUT = 18
+CODE_DUPLICATE_MEMBER = 26
 
 # Offsets into the container layout of the spec, for the tests that damage a file.
 HEADER_LEN = 64
@@ -597,10 +600,13 @@ def stall_during(action: Callable[[], object]) -> tuple[float, float]:
     while not ticks:
         time.sleep(0.001)
     start = time.perf_counter()
-    action()
-    end = time.perf_counter()
-    stop.set()
-    thread.join()
+    try:
+        action()
+        end = time.perf_counter()
+    finally:
+        # A failing action must still stop the ticker, or the interpreter waits for it at exit.
+        stop.set()
+        thread.join()
     moments = [start, *(tick for tick in ticks if start < tick < end), end]
     return max(after - before for before, after in zip(moments, moments[1:])), end - start
 
@@ -700,6 +706,58 @@ def test_runtime_names_are_in_the_stub() -> None:
     # The package maturin generates holds the extension as a submodule of the same name, and
     # `torch` and `safetensors` are the pure-Python submodules, here once any test imported them.
     assert public - {"ziptensors", "torch", "safetensors"} == declared
+
+
+def runtime_callables() -> list[tuple[str, Callable[..., object]]]:
+    """Every public function of the module and every public method of its public classes."""
+    found: list[tuple[str, Callable[..., object]]] = []
+    for name in dir(ziptensors):
+        value = getattr(ziptensors, name)
+        if name.startswith("_") or inspect.ismodule(value):
+            continue
+        if inspect.isclass(value):
+            for member in ["__init__", "__new__", *dir(value)]:
+                if member.startswith("_") and member not in ("__init__", "__new__"):
+                    continue
+                method = getattr(value, member, None)
+                if callable(method) and not inspect.isclass(method):
+                    found.append((f"{name}.{member}", method))
+        elif callable(value):
+            found.append((name, value))
+    return found
+
+
+def test_signatures_show_real_defaults() -> None:
+    """pyo3 renders a default that is not a Python literal as `...`, which tells a caller nothing."""
+    checked = 0
+    for name, function in runtime_callables():
+        try:
+            signature = inspect.signature(function)
+        except (TypeError, ValueError):
+            # Builtins of `object` and exceptions have no text signature; nothing of ours to check.
+            continue
+        checked += 1
+        for parameter in signature.parameters.values():
+            assert parameter.default is not Ellipsis, f"{name}({parameter.name}=...)"
+    assert checked > 0
+    assert inspect.signature(ziptensors.recover).parameters["max_candidates"].default == 64
+
+
+def test_a_member_name_given_twice_is_an_input_error(tmp_path: Path, source: Path) -> None:
+    """A duplicate in a write request is the caller's, not damage: `InputError`, code 26."""
+    output = tmp_path / "twice.ziptensors"
+    with pytest.raises(InputError) as caught:
+        ziptensors.pack([(source, "m"), (source, "m")], output, threads=1)
+    assert caught.value.code == CODE_DUPLICATE_MEMBER
+    assert '"m"' in str(caught.value)
+    assert not output.exists(), "pack checks every name before it starts the output"
+
+    with PackBuilder(output, threads=1) as builder:
+        builder.add_file(source, "m")
+        with pytest.raises(InputError) as caught:
+            builder.add_file(source, "m")
+        assert caught.value.code == CODE_DUPLICATE_MEMBER
+    assert not output.exists()
 
 
 def test_pack_accepts_path_like_and_str(tmp_path: Path, source: Path) -> None:

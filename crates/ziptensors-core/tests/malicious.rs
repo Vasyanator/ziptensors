@@ -10,6 +10,8 @@
 //! - delta blobs (spec section 7a): the same promise over `harness::delta_sample` when the base
 //!   chunks, the delta chunks, `PARM` or the base references change, and decode work that counts the
 //!   base once per delta extent;
+//! - recovery (spec section 9.3): fake `end_magic`s and self-consistent fake footers against the scan
+//!   bounds, candidates that must not allocate or must be skipped;
 //! - the seeded mutator: the fuzz targets' own functions, on stable, on every `cargo test`.
 //!
 //! Key structures: `Kit` (hostile file builder), `Counting` (the allocator of this binary), `Peak`,
@@ -41,7 +43,9 @@ mod fixtures;
 mod harness;
 
 use fixtures::{Elem, GgufOptions, OnnxModel, OnnxTensor, PtZipOptions, Rng, TensorSpec};
-use harness::{Bytes, Prng, Sample, assemble, assemble_with, delta_sample, sample, split_file};
+use harness::{
+    Bytes, Prng, Sample, append_generation, assemble, assemble_with, delta_sample, sample, split_file,
+};
 use ziptensors_core::chain::{BLOB_KIND_DELTA, FEATURE_DELTA, RawStep};
 use ziptensors_core::codec::{StreamPolicy, Workspace, encode_chunk, widen_into};
 use ziptensors_core::format::{
@@ -50,8 +54,9 @@ use ziptensors_core::format::{
 };
 use ziptensors_core::io::TEMP_FILE_SUFFIX;
 use ziptensors_core::{
-    Chain, Container, DeltaOp, Dtype, ElementWidth, EncodeOptions, Error, ErrorCode, Layout as ChunkLayout,
-    Mode, OpenOptions, Profile, RandomAccess, ReadRequest, Step, Verify, View, encode_file,
+    Candidate, Chain, Container, DeltaOp, Dtype, ElementWidth, EncodeOptions, Error, ErrorCode,
+    Layout as ChunkLayout, Mode, OpenOptions, Profile, RandomAccess, ReadRequest, RecoverOptions, Scan,
+    ScanBudget, ScanOutcome, Step, Verify, View, encode_file, find_last_valid_generation, recover,
 };
 
 /// Counts live bytes and their peak, passing everything to the system allocator.
@@ -521,7 +526,8 @@ fn file_with_stored_index(stored: &[u8], raw_index: &[u8]) -> Vec<u8> {
     let mut file = Header::current().to_bytes().to_vec();
     let index_offset = file.len() as u64;
     file.extend_from_slice(stored);
-    let footer = Footer::for_index(index_offset, stored.len() as u64, raw_index);
+    let generation = ziptensors_core::format::GENERATION_INITIAL;
+    let footer = Footer::for_index(index_offset, stored.len() as u64, raw_index, generation);
     file.extend_from_slice(&footer.to_bytes());
     file
 }
@@ -529,7 +535,9 @@ fn file_with_stored_index(stored: &[u8], raw_index: &[u8]) -> Vec<u8> {
 #[test]
 fn an_index_declared_over_one_gib_is_refused_under_any_configuration() {
     let _guard = exclusive();
-    let footer = Footer { index_raw_len: (1 << 30) + 1, ..Footer::for_index(64, 16, &[]) };
+    let generation = ziptensors_core::format::GENERATION_INITIAL;
+    let footer =
+        Footer { index_raw_len: (1 << 30) + 1, ..Footer::for_index(64, 16, &[], generation) };
     let mut file = Header::current().to_bytes().to_vec();
     file.extend_from_slice(&[0; 16]);
     file.extend_from_slice(&footer.to_bytes());
@@ -1741,6 +1749,147 @@ fn the_fuzz_target_profile_scan_survives_the_seeded_mutator() {
             harness::profile_scan(&mutated);
         }
     }
+}
+
+#[test]
+fn the_fuzz_target_recover_scan_survives_the_seeded_mutator() {
+    let _guard = shared();
+    let mut rng = Prng(56);
+    for seed in 0..6 {
+        let file = if seed < 4 { sample(seed).file } else { delta_sample(seed).file };
+        let two = append_generation(&file);
+        let fixed = harness::to_fixed_up_input(&file);
+        // The fixed-up form of `recover_scan` has two lengths where `open_and_read` has one.
+        let (data, raw_index) = split_file(&file);
+        let mut recover_fixed = vec![fixed[0]];
+        recover_fixed.extend_from_slice(&u32::try_from(data.len()).expect("small").to_le_bytes());
+        recover_fixed.extend_from_slice(&u32::try_from(raw_index.len()).expect("small").to_le_bytes());
+        recover_fixed.extend_from_slice(&data);
+        recover_fixed.extend_from_slice(&raw_index);
+        recover_fixed.extend_from_slice(&two[file.len()..]);
+        let raw = [&[0x80], two.as_slice()].concat();
+        harness::recover_scan(&raw);
+        harness::recover_scan(&recover_fixed);
+        for round in 0..400 {
+            let mut input = if round % 2 == 0 { raw.clone() } else { recover_fixed.clone() };
+            let form = input[0];
+            // The bytes that matter sit at the end: the second generation's index and footer.
+            let keep = input.len() - rng.below(input.len().min(600));
+            let mut tail = input.split_off(keep);
+            harness::mutate(&mut rng, &mut tail);
+            input.append(&mut tail);
+            input[0] = form | (u8::try_from(rng.below(16)).expect("small") << 4);
+            harness::recover_scan(&input);
+        }
+    }
+}
+
+/// A scan of `file` in memory under `budget` and the harness's one-thread options.
+fn scan_of(file: Vec<u8>, budget: &ScanBudget) -> Result<Scan, Error> {
+    let source: Arc<dyn RandomAccess> = Arc::new(Bytes(file));
+    find_last_valid_generation(&source, &options(), budget)
+}
+
+/// The scan outcome that finds a generation of `generation` ending at `valid_len`.
+fn found_at(valid_len: usize, generation: u64) -> ScanOutcome {
+    ScanOutcome::Found(Candidate { valid_len: valid_len as u64, generation })
+}
+
+#[test]
+fn a_thousand_fake_end_magics_cost_scan_bytes_and_no_candidate() {
+    let _guard = exclusive();
+    let valid = stored_file(&[7; 4096]);
+    let mut file = valid.clone();
+    for _ in 0..1000 {
+        file.extend_from_slice(&[0x42; 56]);
+        file.extend_from_slice(b"ZTS-END\0");
+    }
+    let len = file.len();
+    let (scan, peak) = measure(|| scan_of(file, &ScanBudget::default()).expect("scans"));
+    assert_eq!(scan.outcome, found_at(valid.len(), 1));
+    assert_eq!(scan.candidates_checked, 1, "only the real footer has a valid hash");
+    assert_eq!(scan.scanned_bytes, (len - 64) as u64, "one block reaches the header");
+    peak.assert_within(len + MIB, "a scan of fake end magics");
+}
+
+/// `count` fake generations after `valid`: each a stored index that decompresses and fails to parse,
+/// and a footer for it with valid hashes and layout.
+fn fake_generations(valid: &[u8], count: u64) -> Vec<u8> {
+    let raw_index = [0xFF; 256];
+    let stored = zstd::bulk::compress(&raw_index, 1).expect("compress");
+    let mut file = valid.to_vec();
+    for generation in 2..2 + count {
+        let footer = Footer::for_index(file.len() as u64, stored.len() as u64, &raw_index, generation);
+        file.extend_from_slice(&stored);
+        file.extend_from_slice(&footer.to_bytes());
+    }
+    file
+}
+
+#[test]
+fn self_consistent_fake_footers_exhaust_the_candidates_and_the_file_is_unrecoverable() {
+    let _guard = shared();
+    let valid = stored_file(&[9; 1000]);
+    let file = fake_generations(&valid, 100);
+    let scan = scan_of(file.clone(), &ScanBudget::default()).expect("scans");
+    assert_eq!((scan.outcome, scan.candidates_checked), (ScanOutcome::CandidatesExhausted, 64));
+    let enough = ScanBudget { max_candidates: 101, ..ScanBudget::default() };
+    let scan = scan_of(file.clone(), &enough).expect("scans");
+    assert_eq!((scan.outcome, scan.candidates_checked), (found_at(valid.len(), 1), 101));
+
+    let scratch = Scratch::new();
+    let path = scratch.0.join("fakes");
+    fs::write(&path, &file).expect("writes");
+    let error = recover(&path, &RecoverOptions::default()).expect_err("too many candidates");
+    assert!(matches!(error, Error::Unrecoverable { .. }), "{error:?}");
+    assert_eq!(fs::read(&path).expect("reads"), file);
+}
+
+/// A footer whose stored index is longer than zstd ever makes its raw length stops the scan before
+/// the stored index is allocated. It is not skipped: only a deliberately written footer has a valid
+/// hash, and the scan never cuts past a candidate it could not judge.
+#[test]
+fn a_stored_index_over_its_compress_bound_stops_the_scan_without_allocating_it() {
+    let _guard = exclusive();
+    let valid = stored_file(&[3; 1000]);
+    let mut file = valid;
+    file.resize(file.len() + 8 * MIB, 0);
+    let footer_at = file.len() as u64;
+    let footer = Footer::for_index(64, footer_at - 64, &[0; 100], 2);
+    file.extend_from_slice(&footer.to_bytes());
+    let len = file.len();
+    let (error, peak) = measure(|| scan_of(file, &ScanBudget::default()).expect_err("refused"));
+    assert!(matches!(error, Error::BudgetExceeded { what: "stored index", .. }), "{error:?}");
+    peak.assert_within(len / 4, "a stored index of 8 MiB declared");
+}
+
+#[test]
+fn a_candidate_whose_index_starts_inside_the_header_is_skipped() {
+    let _guard = shared();
+    let valid = stored_file(&[5; 1000]);
+    let mut file = valid.clone();
+    let footer = Footer::for_index(10, valid.len() as u64 + 64 - 10, &[], 2);
+    file.extend_from_slice(&footer.to_bytes());
+    let scan = scan_of(file, &ScanBudget::default()).expect("scans");
+    assert_eq!((scan.outcome, scan.candidates_checked), (found_at(valid.len(), 1), 2));
+}
+
+#[test]
+fn a_spent_scan_byte_budget_is_unrecoverable_and_changes_nothing() {
+    let _guard = shared();
+    let valid = stored_file(&[1; 1000]);
+    let file = [valid.as_slice(), &[0x77; 10_000]].concat();
+    let scratch = Scratch::new();
+    let path = scratch.0.join("torn");
+    fs::write(&path, &file).expect("writes");
+    let budget = ScanBudget { max_scan_bytes: 4096, ..ScanBudget::default() };
+    let options = RecoverOptions { budget, ..RecoverOptions::default() };
+    let error = recover(&path, &options).expect_err("the budget ends first");
+    assert!(matches!(error, Error::Unrecoverable { scanned: 4096, .. }), "{error:?}");
+    assert_eq!(fs::read(&path).expect("reads"), file);
+    let options = RecoverOptions { budget: ScanBudget::default(), ..options };
+    let report = recover(&path, &options).expect("recovers");
+    assert_eq!((report.valid_len, report.truncated), (valid.len() as u64, true));
 }
 
 /// An `F32` file that is exact as `F16`, with its last element made inexact if `late_mismatch`.

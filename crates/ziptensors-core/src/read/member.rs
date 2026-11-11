@@ -1,9 +1,10 @@
 //! File: read/member.rs
 //! Purpose: one member of a container: reads by offset and by tensor name.
 //!
-//! Main responsibilities: [`Member`] with `read_at`, `decode_tensor_into`, `read_many`, the
-//! member's tensor table, and the chunk geometry of a member range (`chunk_aligned_end`,
-//! `chunk_window`) for the streaming reads of `restore.rs` and the windows of `cache.rs`.
+//! Main responsibilities: [`Member`] with `read_at`, `decode_tensor_into`, `read_many`, its record
+//! accessors (`len`, `blake3`, `profile`, `name`), the member's tensor table, and the chunk
+//! geometry of a member range (`chunk_aligned_end`, `chunk_window`) for the streaming reads of
+//! `restore.rs` and the windows of `cache.rs`.
 //!
 //! Key structures: [`Member`], [`ReadRequest`].
 //!
@@ -14,7 +15,7 @@ use std::ops::Range;
 
 use crate::error::Error;
 use crate::format::{ExtentRecord, MemberRecord};
-use crate::types::TensorInfo;
+use crate::types::{Profile, TensorInfo};
 
 use super::batch::{BlobView, Segment, Segments, broken, read_segments, to_usize};
 use super::container::{Container, Shared};
@@ -92,6 +93,13 @@ impl Member {
     #[must_use]
     pub fn blake3(&self) -> [u8; 32] {
         self.record.blake3
+    }
+
+    /// The source format the writer recognized, as the file states it. A hint: it never decides
+    /// restored bytes, and an id this build does not know is [`Profile::Unknown`].
+    #[must_use]
+    pub fn profile(&self) -> Profile {
+        self.record.profile
     }
 
     /// The name of this member.

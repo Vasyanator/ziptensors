@@ -1,10 +1,10 @@
 //! File: read.rs
-//! Purpose: the reading half of the C ABI: containers, members, tensors, restore.
+//! Purpose: the reading half of the C ABI: containers, members, tensors, verify, restore.
 //!
-//! Main responsibilities: the opaque handles [`ZtContainer`] and [`ZtMember`], and the entry points
-//! over `Container` and `Member`.
+//! Main responsibilities: the opaque handles [`ZtContainer`] and [`ZtMember`], the entry points
+//! over `Container` and `Member`, and the `ZT_PROFILE_*` wire ids of `zt_member_desc.profile`.
 //!
-//! Key structures: [`ZtContainer`], [`ZtMember`], [`ZtTensorDesc`].
+//! Key structures: [`ZtContainer`], [`ZtMember`], [`ZtTensorDesc`], [`ZtMemberDesc`].
 //!
 //! Implementation notes: core keeps names as Rust strings without a terminating NUL, so a member builds
 //! a table of terminated copies the first time C asks for a tensor, and every pointer handed to C
@@ -18,7 +18,7 @@ use ziptensors_core::{Container, Error, Member};
 
 use crate::args::{check_dst, handle, path, reset_out, text, zeroed_dst};
 use crate::barrier::{guarded, guarded_value};
-use crate::options::{ZtOpenOptions, open_options};
+use crate::options::{ZtOpenOptions, check_out_size, open_options};
 use crate::status::{Failure, ZtStatus};
 
 /// An open container. Create with `zt_open`, free with `zt_close`. Every function taking a
@@ -76,6 +76,36 @@ pub struct ZtTensorDesc {
     /// Element type: the wire id of the dtype registry in `spec/ziptensors-format.md`. A hint, and ids
     /// unknown to the caller are legal.
     pub dtype: u16,
+}
+
+/// `zt_member_desc.profile`: no structure was recognized; the member is stored as bytes. The profile
+/// ids are literals, as cbindgen does not evaluate core's mapping; a test pins them to `Profile`.
+pub const ZT_PROFILE_OPAQUE: u8 = 0;
+/// safetensors.
+pub const ZT_PROFILE_SAFETENSORS: u8 = 1;
+/// GGUF.
+pub const ZT_PROFILE_GGUF: u8 = 2;
+/// ONNX protobuf.
+pub const ZT_PROFILE_ONNX: u8 = 3;
+/// `PyTorch` ZIP archive.
+pub const ZT_PROFILE_PT_ZIP: u8 = 4;
+
+/// What a container states about one member, filled in by `zt_member_info`. Set `struct_size` to
+/// `sizeof(zt_member_desc)` before the call; the library checks it and writes the whole struct.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+pub struct ZtMemberDesc {
+    /// `sizeof(zt_member_desc)` of the header the caller was built with. Set by the caller.
+    pub struct_size: usize,
+    /// Length of the member in bytes.
+    pub len: u64,
+    /// BLAKE3 of the whole content, as the file states it. `zt_member_verify` checks it.
+    pub blake3: [u8; 32],
+    /// The source format the writer recognized, one of `ZT_PROFILE_*`. A hint: ids unknown to the
+    /// caller are legal.
+    pub profile: u8,
+    /// Number of tensors in the member's table.
+    pub tensor_count: u32,
 }
 
 /// Opens the container at `path`, recognized by its magic and not by its name. On success `*out` is
@@ -409,6 +439,93 @@ pub unsafe extern "C" fn zt_restore_file(member: *const ZtMember, path: *const c
         // SAFETY: `path` is covered by this function's contract and outlives the call.
         let output = unsafe { self::path(path, "path") }?;
         member.inner.restore_file(output)?;
+        Ok(())
+    })
+}
+
+/// Fills `*out` with what the container states about member `index`, in file order. The caller sets
+/// `out->struct_size` to `sizeof(zt_member_desc)` first; on any failure `*out` is untouched. Nothing
+/// is decoded: the hash and the lengths are what the index says.
+///
+/// Returns `ZT_STATUS_STRUCT_SIZE` if `out->struct_size` is not the size this library knows, and
+/// `ZT_STATUS_INVALID_ARGUMENT` if `index` is not below `zt_member_count`.
+///
+/// # Safety
+/// `container` must be NULL or a live handle. `out` must be NULL or valid for reads of its first field
+/// and for a write of a whole `zt_member_desc`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zt_member_info(
+    container: *const ZtContainer,
+    index: usize,
+    out: *mut ZtMemberDesc,
+) -> ZtStatus {
+    guarded("zt_member_info", || {
+        // SAFETY: `container` is covered by this function's contract and is shared for the call.
+        let container = unsafe { handle(container, "container") }?;
+        // SAFETY: `out` is covered by this function's contract.
+        unsafe { check_out_size(out, "out") }?;
+        let members = container.inner.members();
+        let info = members.get(index).ok_or_else(|| Failure::Invalid {
+            detail: format!("member {index} of {}", members.len()),
+        })?;
+        let desc = ZtMemberDesc {
+            struct_size: size_of::<ZtMemberDesc>(),
+            len: info.len,
+            blake3: info.blake3,
+            profile: info.profile.to_wire(),
+            tensor_count: info.tensor_count,
+        };
+        // SAFETY: `check_out_size` proved `out` is not NULL and states this build's size, and it is
+        // writable by this function's contract.
+        unsafe { out.write(desc) };
+        Ok(())
+    })
+}
+
+/// Decodes the whole member and compares its BLAKE3 with the hash the container states. Writes
+/// nothing. Returns `ZT_STATUS_VERIFY_FAILED` if the hash differs, or the status of the decoding
+/// failure, `ZT_STATUS_CHECKSUM_MISMATCH` or `ZT_STATUS_CHUNK_CORRUPT` for example.
+///
+/// # Safety
+/// `member` must be NULL or a live handle.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zt_member_verify(member: *const ZtMember) -> ZtStatus {
+    guarded("zt_member_verify", || {
+        // SAFETY: `member` is covered by this function's contract and is shared for the call.
+        let member = unsafe { handle(member, "member") }?;
+        member.inner.verify()?;
+        Ok(())
+    })
+}
+
+/// Restores every member to `dir` joined with its name, in file order, each as `zt_restore_file`
+/// does, creating `dir` and the directories the names need. On success, unless `bytes_out` is NULL,
+/// `*bytes_out` is the number of bytes written over all members; it is untouched on failure.
+///
+/// Every name is checked before anything is created: with one name a restore must refuse (`..`, an
+/// absolute path, a drive letter), the call returns `ZT_STATUS_UNSAFE_MEMBER_NAME` and creates
+/// nothing, not even `dir`. After that, a failure stops the run and keeps the members restored before
+/// it; the failed member leaves no file.
+///
+/// # Safety
+/// `container` must be NULL or a live handle. `dir` must be NULL or NUL-terminated, and is only read
+/// during the call. `bytes_out` must be NULL or valid for a write, and is not read.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn zt_restore_all(
+    container: *const ZtContainer,
+    dir: *const c_char,
+    bytes_out: *mut u64,
+) -> ZtStatus {
+    guarded("zt_restore_all", || {
+        // SAFETY: `container` is covered by this function's contract and is shared for the call.
+        let container = unsafe { handle(container, "container") }?;
+        // SAFETY: `dir` is covered by this function's contract and outlives the call.
+        let dir = unsafe { path(dir, "dir") }?;
+        let report = container.inner.restore_all(dir)?;
+        if !bytes_out.is_null() {
+            // SAFETY: not NULL, and writable by this function's contract.
+            unsafe { bytes_out.write(report.bytes) };
+        }
         Ok(())
     })
 }

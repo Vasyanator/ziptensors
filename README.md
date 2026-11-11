@@ -57,18 +57,38 @@ ziptensors verify models.ziptensors
 # Get files back
 ziptensors restore model.ziptensors model.safetensors          # the only member
 ziptensors restore models.ziptensors --all restored/           # every member under a directory
-ziptensors extract models.ziptensors sdxl-inpaint/unet/diffusion_pytorch_model.safetensors unet.safetensors
+ziptensors extract models.ziptensors unet/diffusion_pytorch_model.safetensors unet.safetensors  # names relative to sdxl-inpaint/
 
 # Copy members of several containers into one, without recompressing
 ziptensors merge all.ziptensors a.ziptensors b.ziptensors
 
+# Change a container: add, rename-on-add, remove, replace (default: rewrite through a temporary file)
+ziptensors edit models.ziptensors --add lora.safetensors --add-as vae/vae.safetensors new-vae.safetensors
+ziptensors edit models.ziptensors --remove old.safetensors --replace config.json config-v2.json
+ziptensors edit models.ziptensors --add extra.safetensors -F   # append only: fast, old data stays as dead bytes
+ziptensors compact models.ziptensors                          # drop dead bytes; -C re-encodes every member
+ziptensors recover models.ziptensors --dry-run                # after an interrupted -F: what would be cut
+# -R rewrites in place with no extra space: an interruption DAMAGES the container. Keep a backup.
+
+# A member to standard output; the tensor table of every member
+ziptensors extract models.ziptensors config.json - | head
+ziptensors inspect models.ziptensors --tensors
+
+# Every weight file of a tree into its own container beside it, and back (originals removed once proven)
+ziptensors compress -r stable-diffusion-v1-5/
+ziptensors decompress -r stable-diffusion-v1-5/
+
 # Show the members as read-only files until Ctrl-C (Linux: an existing directory; Windows: X: or a new directory)
 ziptensors mount models.ziptensors /mnt/models
+# A tree after `compress -r`, shown with its original file names (other files pass through)
+ziptensors mount --overlay stable-diffusion-v1-5/ /mnt/sd15
 ```
 
 `--threads N` sets the thread count (default: one per logical CPU). `ziptensors <command> --help`
-lists every option. Symbolic links and `*.incomplete` files are skipped by `pack`, with a log line.
-Restore is content-only: modification times and permissions are not kept.
+lists every option. Symbolic links and `*.incomplete` files are skipped by `pack` and `compress`, with a
+log line (`compress --follow-symlinks` follows links, which breaks a Hugging Face cache). Pass
+`--max-total-decoded BYTES` to any command that opens a container you did not write. Restore is
+content-only: modification times and permissions are not kept.
 
 ## Quick start: Python
 
@@ -104,6 +124,44 @@ Reads release the GIL and are safe from many threads. `Member.open()` returns a 
 file object, for example for `torch.load`. Quantized GGUF tensors are never dequantized: they are
 refused by default or handed over as raw blocks (`quantized="raw"` or `"diffusers"`).
 
+## API and CLI at a glance
+
+Full user documentation is in [`docs/`](docs/README.md).
+
+**Command line** ([`docs/cli.md`](docs/cli.md); exit codes 0 success, 1 failure, 2 usage):
+
+| Command | What it does |
+|---|---|
+| `encode IN OUT` | One file into a container of one member (mode `balanced`) |
+| `pack OUT INPUTS...` | Files and directories into one container (mode `max`, deduplication, `--delta-base`) |
+| `edit C --add/--add-as/--remove/--replace` | Change members; default rewrite, `-F` append, `-R` in place, `-C` repack ([`docs/editing.md`](docs/editing.md)) |
+| `compact C` | Drop dead data of earlier appends; `-C` re-encodes every member |
+| `recover C` | Cut a torn end back to the latest valid generation; `--dry-run` first |
+| `restore C OUT`, `restore C --all DIR` | Restore the only member, or every member |
+| `extract C MEMBER OUT\|-` | Restore one member to a file or to standard output |
+| `merge OUT INPUTS...` | Copy members of several containers into one, no recompression |
+| `inspect C` | Members and saved bytes; `--tensors`, `--json` |
+| `verify C` | Decode every member and check its BLAKE3 |
+| `compress -r DIR`, `decompress -r DIR` | Per-file containers beside each weight file, and back ([`docs/directories.md`](docs/directories.md)) |
+| `mount C MNT`, `mount --overlay DIR MNT` | Read-only files until Ctrl-C, Linux and Windows ([`docs/mount.md`](docs/mount.md)) |
+
+**Python** ([`docs/python.md`](docs/python.md)): `Container(path, max_total_decoded=...)` with
+`member(name)` and `restore_all(dir)`; `Member` with `tensors`, `read_at`, `decode_tensor_into`,
+`open()`, `restore_file`, `verify`; writers `encode_file`, `pack`, `PackBuilder`; `edit` (`AddOp`,
+`RemoveOp`, `ReplaceOp`), `compact`, `recover`; `compress_tree`, `decompress_tree`; `mount`,
+`mount_overlay`; adapters `ziptensors.torch.load_state_dict` and `ziptensors.safetensors.safe_open`.
+
+**Rust** ([`docs/rust.md`](docs/rust.md)), crate `ziptensors-core`: `Container::open(path, &OpenOptions)`,
+`Container::member`/`single`, `Member` (`read_at`, `decode_tensor_into`, `restore_file`), `ReadCache`;
+`encode_file`, `PackBuilder`; `edit` with `EditOp`/`EditOptions`/`Strategy`; `recover`;
+`tree::compress_tree`/`decompress_tree`; `Error` with a stable `ErrorCode`. The mount is the crate
+`ziptensors-mount`.
+
+**C** ([`docs/c-api.md`](docs/c-api.md)), `ziptensors.h`: `zt_open`/`zt_close`, `zt_member_open`,
+`zt_read_at`, `zt_decode_tensor_into`, `zt_restore_file`, `zt_restore_all`; `zt_encode_file`,
+`zt_pack_new`/`zt_pack_add_file`/`zt_pack_finish`; `zt_edit`, `zt_recover`; fallible calls return a
+`zt_status`, and `zt_last_error` gives the message.
+
 ## Example: Stable Diffusion with Diffusers
 
 [`examples/diffusers_from_container.py`](examples/diffusers_from_container.py) runs a Diffusers model
@@ -135,6 +193,28 @@ Every weight is bit-exact, so the pipeline is the one `from_pretrained` builds f
 directory: in our test (Stable Diffusion 1.5, FP16, 20 steps, fixed seed, ROCm GPU) both wrote the same
 PNG, byte for byte. On Linux and Windows, `ziptensors mount` plus the usual
 `from_pretrained` on the mounted directory is the alternative.
+
+A model directory compressed in place, each weight file replaced by a container beside it, works too.
+Configs and tokenizers are read from the directory; each model's weights come from its containers,
+found by the member name (the original file name), shards through `*.index.json`, a legacy `.bin` only
+through `torch.load(..., weights_only=True)`. On macOS, which has no mount, this is the route:
+
+```sh
+ziptensors compress -r stable-diffusion-v1-5/
+python examples/diffusers_from_container.py --per-file-dir stable-diffusion-v1-5/ "a lighthouse at sunset" out.png
+```
+
+A pipeline that takes an input image (img2img) or an image and a mask (inpainting) gets them from
+`--image PATH` and `--mask PATH`; without them the example stops before loading any weight. A model must
+get every tensor it keeps. A checkpoint tensor the model does not keep is accepted only where Diffusers
+and Transformers accept it too (a non-persistent buffer such as CLIP's `position_ids`, or a name the
+model class ignores on loading), and is logged; any other is an error.
+
+```sh
+ziptensors compress -r sdxl-inpainting/
+python examples/diffusers_from_container.py --per-file-dir sdxl-inpainting/ --variant fp16 \
+    "a red apple on a table" out.png --image photo.png --mask mask.png
+```
 
 ## Modes
 
@@ -195,7 +275,9 @@ numbers: [`dev-docs/benchmarks/`](dev-docs/benchmarks/).
 (diffusers `from_pretrained`, llama.cpp, safetensors with mmap; all checked bit-exact through the
 mount) read a container unmodified. Decoded
 data is cached in memory (`--cache-size`, default 256 MiB). The command runs in the foreground; Ctrl-C
-unmounts.
+unmounts. From Python, `ziptensors.mount(container, mountpoint)` and
+`ziptensors.mount_overlay(directory, mountpoint)` mount with the same defaults and return a context
+manager that unmounts when its `with` block ends.
 
 - **Linux:** FUSE through the kernel's `/dev/fuse`; no libfuse is needed, only `fusermount3` on the
   `PATH` (usually from the `fuse3` package).
@@ -244,6 +326,14 @@ current format version is **0.3**, the first public one. A file written by any p
 readable by every later reader; a file using something an older reader does not know makes that reader
 fail with an error, never with wrong bytes. A file is recognised by its magic bytes; the `.ziptensors`
 extension is a convention.
+
+A container can be changed by appending: new data, then a new index and footer, follow the old end of
+the file, and the old index stays inside it as unreferenced bytes (`ziptensors edit --fast`). An
+interrupted append leaves the previous version intact below a partial tail. A reader never falls back
+to that version on its own: such a file fails to open until `ziptensors recover` shortens it to its
+last valid version, after decoding every member to check it. The default edit rewrites the file
+through a temporary one instead, and `--risky` rewrites it in place, which an interruption damages.
+None of this changes the format version.
 
 The format version is independent of the package versions (crates and the Python package start at
 0.1.0). Below 1.0, a minor release of the packages may change their programming interfaces.

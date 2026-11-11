@@ -30,7 +30,8 @@ chunk hashes) sees the combined bytes, so only the decode of one chunk knows abo
 
 `capi`, `py`, `cli` and `mount` depend on `core` and hold no format logic: they translate arguments. The one
 adapter layer is the pure-Python `ziptensors.torch`, which maps tensor tables to torch objects. `cli`
-depends on `mount` on Linux and Windows. `mount` reads through `core::ReadCache` alone; it owns member
+depends on `mount` on Linux and Windows. `mount` reads containers through `core::ReadCache` alone (an overlay of a directory, built from
+`core::tree::scan_view`, also passes plain files through); it owns member
 names as paths (per-OS `NamePolicy`), node ids and the OS protocol. Its neutral part builds on every target, each
 OS backend sits behind `cfg`, and a tree whose names the OS cannot show refuses to mount.
 
@@ -39,6 +40,12 @@ Inside `core`:
 - `read`, `write` -> `format`, `codec`, `io`
 - `write` -> `profile`, `read`. The commit proves a file through the real `Container`, and a member copy
   reads the source's index and stored bytes through crate-private accessors. `read` never uses `write`.
+- `edit` -> `write`, `read`, `format`, `io`. It orchestrates `PackBuilder` over an existing container
+  and owns no format logic; `compact` is an edit without operations.
+- `recover` -> `read`, `format`, `io`.
+- `tree` -> `write`, `read`, `profile`, `format`, `io`: per-file containers over a directory tree;
+  nothing in core depends on it. Its `.ziptensors` name is a convention; the member name is what a
+  restore writes.
 - `profile` -> `io`, `types`. It knows nothing of the format.
 - `format`, `codec` -> `chain`. They do no file I/O and do not depend on each other.
 - `error`, `chain`, `types` are leaves used by all. `chain` depends only on `error`, and `types` only
@@ -60,7 +67,9 @@ Unknown dtypes and profiles are legal, since they are hints. Ids stay raw until 
 so an unknown one is rejected with `UnknownCodec` and an invalid `Chain` cannot exist.
 
 A caller opening untrusted input must set `max_total_decoded`: the library default is `u64::MAX`, no
-budget. Decode work is bounded per container, with one floor, and names by a limit that also bounds memory.
+budget. In the C ABI alone 0 also means no budget, since C has no "unset"; Rust, Python and the CLI
+take 0 literally. Decode work is bounded per container, with one floor, and names by a limit that
+also bounds memory.
 
 **What the hashes do not protect.** They detect damage; nothing authenticates a file. There is no
 signature or key, so anyone who can change a file can recompute every hash, and a forged file passes.
@@ -111,10 +120,17 @@ compressed streams (large low-entropy models, widened F32 in `fast`, field-split
 duplicate or a late widening mismatch rolls back the logical append position. Inputs are re-checked at
 commit. The bound is ≤ 6 × threads × chunk plus the index, and ≤ 9 × threads × chunk once a delta blob has been streamed (each windowed chunk holds its base chunk, each workspace a residual buffer).
 
-**Commit.** Temporary file in the output directory, full decode and BLAKE3 against the source, sync,
-close, rename. No opt-out. `io::TempFile` is the one owner of this sequence, for writes and restores.
-Any failed commit leaves the output untouched except `Error::CommittedNotDurable`: the rename happened
-but the directory sync after it (Unix) failed, so the new file is in place without confirmed durability.
+**Commit.** Every write ends in one of three endings, and `write::commit` alone chooses it. Rename
+(spec invariant 12 (a), the default): temporary file in the output directory, full decode and BLAKE3
+against the source, sync, rename; `io::TempFile` owns this sequence, for writes and restores. Append
+(12 (b), `edit -F`): data, index and footer after the old end, verified before the index is written,
+truncated back on failure. In place (`edit -R`): outside invariant 12, a failure after the first move
+is `Error::DamagedInPlace`. No ending skips the full decode. A failed rename or append leaves the
+output as it was, except `Error::CommittedNotDurable` (the directory sync after a rename failed) and
+`Error::TrailingBytes` (a truncation failed; the file is valid up to a length `recover` restores).
+
+**Recovery is explicit.** A reader opens only the generation named by the last 64 bytes and never
+falls back. `recover` is the one way to shorten a file to its latest valid generation (spec section 9.3).
 
 `Container` is `Clone` (shared `Arc`), `Send` and `Sync`; methods take `&self` and are safe from
 concurrent threads.

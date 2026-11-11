@@ -1,6 +1,7 @@
 //! File: io/temp.rs
 //! Purpose: the one owner of "temporary file beside the output, sync, close, rename, sync the
-//! directory", the commit protocol of spec invariant 12, for the writer and for a restore alike.
+//! directory", the replace protocol of spec invariant 12, for the writer and for a restore alike.
+//! Which protocol a writer ends with is decided by `write::commit`; this file owns only this one.
 //!
 //! Key structures: [`TempFile`].
 //!

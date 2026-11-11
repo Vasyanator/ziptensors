@@ -15,7 +15,7 @@ members = [
 exclude = ["dev-docs", "fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # The lowest toolchain proven to build the workspace; the `msrv` CI job keeps it so. Development uses
 # the toolchain PROJECT_RULES.md names.
@@ -26,8 +26,8 @@ repository = "https://github.com/Vasyanator/ziptensors"
 homepage = "https://github.com/Vasyanator/ziptensors"
 
 [workspace.dependencies]
-ziptensors-core = { path = "crates/ziptensors-core", version = "0.1.0" }
-ziptensors-mount = { path = "crates/ziptensors-mount", version = "0.1.0" }
+ziptensors-core = { path = "crates/ziptensors-core", version = "0.2.0" }
+ziptensors-mount = { path = "crates/ziptensors-mount", version = "0.2.0" }
 # Exact pin: the measured version; a bump needs a benchmark rerun. No default features, so the
 # legacy decoders stay out of reach of untrusted input.
 zstd = { version = "=0.13.4", default-features = false }

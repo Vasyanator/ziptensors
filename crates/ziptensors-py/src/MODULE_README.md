@@ -2,16 +2,20 @@
 
 ## Purpose
 
-The Python module `ziptensors` over `ziptensors-core`, built as abi3 for CPython 3.11+. This Rust part
-translates arguments, results and errors, and holds no logic of its own. The adapters above it are pure
-Python, in `../python/`.
+The Python module `ziptensors` over `ziptensors-core` (and `ziptensors-mount` for mounts on Linux and
+Windows), built as abi3 for CPython 3.11+. This Rust part translates arguments, results and errors,
+and holds no logic of its own. The adapters above it are pure Python, in `../python/`.
 
 ## Architecture
 
-`Container` and `Member` in Python own a core `Container` and `Member`. Every call that reads the file
-or encodes runs in `Python::detach`; a buffer call goes through `buffer::fill_detached`, which holds the
-`Py_buffer` in the attached frame and passes only the slice into the closure. A core `Error` reaches
-Python through `errors::raised`, the one translation.
+`Container` in Python holds a core `Container` behind a lock, `None` once closed; `Member` owns a core
+`Member`, which keeps the file open after its container is closed. `PackBuilder` holds a core
+`PackBuilder` behind a lock taken for the length of one call and `None` once finished or closed. Every
+call that reads a file, walks a directory, encodes, edits or recovers runs in `Python::detach`; a buffer
+call goes through `buffer::fill_detached` (one buffer) or `buffer::fill_many_detached` (`read_many`),
+which hold the `Py_buffer`s in the attached frame and pass only the slices into the closure. A core
+`Error` reaches Python through `errors::raised`, the one translation; a per-file failure of a tree run is
+handed over as the exception object `errors::to_py_err` builds, not raised.
 
 The packaging lives one level up: `pyproject.toml` for maturin, `ziptensors.pyi` for type checkers,
 which maturin installs with a `py.typed` marker, `python/` for the pure-Python files, and `tests/` for
@@ -25,9 +29,13 @@ pytest. `Member.open` is the one Rust call into Python: it constructs `ziptensor
 | `buffer.rs` | The held destination buffer and `fill_detached`. The only `unsafe` of the crate. |
 | `errors.rs` | `ZiptensorsError`, the family subclasses, the mapping from `ErrorCode`. |
 | `names.rs` | Spec registry names of dtypes and profiles, the strings Python sees. |
-| `reader.rs` | `Container`, `Member`, `MemberInfo`, `Tensor` (with the core's block geometry, `block`). |
-| `report.rs` | Read-only mirrors of the core's report types. |
-| `writer.rs` | `encode_file`, `pack`, and their argument translation. |
+| `reader.rs` | `Container` (open options, `close`, context manager, `layer_report`, `restore_all`), `Member` (with `read_many`), `MemberInfo`, `Tensor` (with the core's block geometry, `block`). |
+| `report.rs` | Read-only mirrors of the core's report types, edit, recover and input walk included. |
+| `writer.rs` | `encode_file`, `pack` (directories through the core walk), `collect_inputs`, `PackBuilder`, the `mode` parser. |
+| `edit.rs` | `edit`, `compact`, `recover`, and the operation classes `AddOp`, `RemoveOp`, `ReplaceOp`. |
+| `tree.rs` | `compress_tree`, `decompress_tree`, and `TreeReport`, `FileOutcome`, `TreeTotals`. |
+| `logging.rs` | `enable_stderr_logging`, the opt-in stderr subscriber. |
+| `mount.rs` | `mount`, `mount_overlay`, the `Mount` handle and `MountError`, over `ziptensors-mount` (Linux and Windows; on macOS the calls raise). |
 
 ## Contracts and invariants
 
@@ -49,7 +57,52 @@ pytest. `Member.open` is the one Rust call into Python: it constructs `ziptensor
   reach the core are ordinary `ValueError`, `TypeError`, `OverflowError`.
 - `dtype` is the registry name of the spec, and `shape` keeps the order of the source file: GGUF stays
   fastest varying first, the reverse of numpy's order.
-- `threads=None` and `threads=0` both mean one per logical CPU, the core's meaning of 0.
+- `read_many` acquires and checks every buffer, then refuses the set if the memory of any two overlaps
+  (the same object twice, two views of one array), all before the first `&mut [u8]` exists: two
+  mutable slices over one byte are undefined behaviour whatever the reads write. Empty buffers overlap
+  nothing.
+- `threads=None` and `threads=0` both mean one per logical CPU, the core's meaning of 0. Open options
+  and every option after `inputs`/`ops`/`path` of the new calls are keyword-only; None takes the core's
+  default, and `max_total_decoded=0` is a budget of zero bytes, as in Rust and the CLI.
+- `Container.close()` and leaving its `with` block drop the handle; later calls raise `ValueError`. A
+  `PackBuilder` call after `finish` or `close` raises `ValueError`; leaving its `with` block without
+  `finish`, `close()`, or dropping the object removes the temporary file (the core builder's drop).
+  The builder is shared between Python threads through its lock, which needs core `PackBuilder: Send`;
+  `writer.rs` asserts that at compile time.
+- Edit operations are the classes `AddOp(path, name=None, *, delta_base=None)`, `RemoveOp(name)`,
+  `ReplaceOp(name, path, *, delta_base=None)`; anything else in `ops` is `TypeError`. `strategy` is
+  `"rewrite"`, `"append"` or `"in_place"`, the core's `Strategy`; `compact` is `edit` with no operation.
+- A tree run reports each status as a string with an optional `reason`, the core's enum names in
+  snake case. The core enums are `#[non_exhaustive]`, so a status this build does not name is
+  `"unknown"` with the core's debug text, rather than a failure of a run that already wrote files.
+- Logging is off unless `enable_stderr_logging(level)` installs a `tracing_subscriber::fmt` subscriber
+  on stderr, once per process (`set_global_default`; later calls change nothing and succeed). There is
+  no bridge to Python's `logging`: a `Layer` that attaches the interpreter from rayon threads needs a
+  design of its own, deferred until a user needs it.
+- `__version__` is the crate version, set by the module init.
+- Deliberately absent: `Member.decode_to(fileobj)` (a callback into Python from a detached closure is
+  a design of its own; `Member.open()` covers streaming).
+- `mount` and `mount_overlay` build the filesystem as `ziptensors mount` does (decode threads, the
+  `ReadCache` of `cache_size`/`readahead`, the OS's name policy, 4 serving threads) and mount it with
+  the GIL released; the filesystem threads never touch Python and no signal is masked, so Ctrl-C stays
+  Python's. Both return one `Mount` class, whose state moves `Mounted` -> `Unmounting` -> `Finished`
+  behind a mutex (never held across the backend's unmount) and a condvar. `unmount()` (also
+  `__exit__`, whatever the block raised) runs detached: the first caller runs the crate's unmount,
+  concurrent callers wait for it, and every caller, later ones included, gets its outcome (a
+  failure as the message of a `MountError` with code `Io`, rebuilt per caller since a `PyErr` is not
+  shared). `is_mounted` is true until that unmount ended. The unmount waits for files open under
+  the mount, so a file the calling thread holds open blocks it. A `Mount` dropped while mounted is
+  unmounted on a thread of its own with a warning, and the drop never blocks: it holds the GIL, and
+  waiting there for a file a Python object holds would deadlock. If that thread cannot start, the
+  handle is leaked and the mount stays until the process exits (logged as an error).
+- `ziptensors-mount` is a dependency on Linux and Windows only. On macOS the functions and `Mount`
+  still exist, so the stub is one for all platforms, and every call raises `MountError` with the code
+  `UnsupportedFeature`. `MountError` is defined in `mount.rs`, not `errors.rs`, because a mount failure
+  has no `ErrorCode` of its own: its `code` is the cause's (see its docstring); a core error from the
+  open is raised as anywhere else, and an overlay option out of range is `ValueError`.
+- Windows mounts load WinFsp (GPL-3.0 with a FLOSS exception): the docstrings of `mount` and
+  `mount_overlay`, the stub and `../README.md` carry its notice and link, as `ARCHITECTURE.md`
+  "Platforms" requires.
 - Rust tests are off for this cdylib; tests run under pytest with a throwaway venv outside the tree:
 
   ```bash
@@ -253,12 +306,28 @@ model on a GPU, and any torch before 2.12, though the `torch` extra states 2.1, 
 ## Budgets
 
 `Container(path, max_total_decoded=...)` is how a restore gets a budget, since core checks it at open. The
-default is core's, no budget, so a caller opening untrusted input must pass one.
+default is core's, no budget, so a caller opening untrusted input must pass one. `edit`, `compact`,
+`compress_tree` and `decompress_tree` take the same keyword for the containers they open; `recover`
+does not, since a budget tighter than the writer's stops the scan at a genuine generation.
+
+## Tests
+
+`tests/test_ziptensors.py` covers reading, encoding, packing, errors and the stub; `tests/test_parity.py`
+the open options, closing, `layer_report`, `restore_all`, `read_many`, `PackBuilder`, directory packing,
+`edit`, `compact`, `recover`, logging and GIL release of the long calls; `tests/test_tree.py` the tree
+runs; `tests/test_mount.py` the mounts (skipped unless Linux with a writable `/dev/fuse` and
+`fusermount3`), each ended inside its test. A container with a name a restore refuses cannot be made through this API (every writer refuses
+one), so `restore_all` on such a name is tested in core (`read/restore.rs`).
 
 ## Editing map
 
-- New binding: a method in `reader.rs` or a function in `writer.rs` over a public `core` API, exported in
-  `lib.rs`, declared in `ziptensors.pyi`. A test compares the stub with the runtime.
+- New binding: a method in `reader.rs`, or a function in `writer.rs` (encode, pack), `edit.rs` (edit,
+  recover) or `tree.rs` (tree runs) over a public `core` API, exported in `lib.rs`, declared in
+  `ziptensors.pyi`. A test compares the stub with the runtime.
+- New edit operation or strategy: `edit.rs` (`core_op`, `parse_strategy`) and the stub.
+- New tree status or reason: `tree.rs`; the core enums are non-exhaustive, so nothing fails to compile.
+- Mount options, backend defaults, the code of a mount failure: `mount.rs` (keep the defaults equal
+  to the CLI's `MountArgs` and the crate's `OverlayOptions::default`).
 - New `ErrorCode`: pick its family in `errors.rs`; the match does not compile until then.
 - New dtype or profile: `names.rs`, same reason.
 - New report field: `report.rs` and the stub.

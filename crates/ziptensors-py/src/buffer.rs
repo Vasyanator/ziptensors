@@ -4,11 +4,13 @@
 //! Main responsibilities:
 //! - [`WritableBuffer`], a held `Py_buffer` that is proven writable, C-contiguous and free of Python
 //!   object pointers, and released on drop;
-//! - [`fill_detached`], the one entry point of the module's buffer calls.
+//! - [`fill_detached`], the entry point of the module's single-buffer calls, and
+//!   [`fill_many_detached`], the one for several buffers, which refuses buffers whose memory
+//!   overlaps before any mutable slice exists.
 //!
 //! Key structures: [`WritableBuffer`].
 //!
-//! Key functions: [`fill_detached`].
+//! Key functions: [`fill_detached`], [`fill_many_detached`].
 //!
 //! Implementation notes: this is the only file with `unsafe`. `pyo3::buffer::PyBuffer<u8>` is not
 //! usable, since it refuses any item that is not a byte, so a float32 array would fail its
@@ -16,6 +18,7 @@
 //! tells the exporter that the caller is going to write.
 
 use std::ffi::{CStr, c_char, c_int};
+use std::ops::Range;
 use std::slice;
 
 use pyo3::exceptions::{PyBufferError, PyOverflowError, PyTypeError};
@@ -102,6 +105,22 @@ impl WritableBuffer {
         Ok(())
     }
 
+    /// The address range of the buffer's bytes, or None for an empty buffer, which holds no byte
+    /// that could alias another.
+    ///
+    /// # Errors
+    /// `BufferError` if the range would wrap the address space, which no real exporter reports.
+    fn address_range(&self) -> PyResult<Option<Range<usize>>> {
+        if self.len == 0 {
+            return Ok(None);
+        }
+        let start = self.view.buf.cast::<u8>().addr();
+        let end = start
+            .checked_add(self.len)
+            .ok_or_else(|| PyBufferError::new_err("destination buffer wraps the address space"))?;
+        Ok(Some(start..end))
+    }
+
     /// The whole buffer, as bytes.
     fn as_mut_slice(&mut self) -> &mut [u8] {
         if self.len == 0 {
@@ -110,8 +129,10 @@ impl WritableBuffer {
         }
         // SAFETY: `check` proved that `len` bytes from `buf` are one writable run, and they stay in
         // place while the view is held, which `&mut self` extends over the slice. `u8` has no
-        // alignment. Exclusivity is the caller's contract, stated on the Python methods: as with
-        // `readinto`, no other thread may touch the buffer during the call.
+        // alignment. Within one call, `fill_many_detached` proved that no two held views overlap
+        // before it made the first slice. Exclusivity against other threads is the caller's
+        // contract, stated on the Python methods: as with `readinto`, no other thread may touch the
+        // buffer during the call.
         unsafe { slice::from_raw_parts_mut(self.view.buf.cast::<u8>(), self.len) }
     }
 }
@@ -149,4 +170,50 @@ where
     let mut buffer = WritableBuffer::acquire(object)?;
     let dst = buffer.as_mut_slice();
     raised(py, py.detach(move || fill(dst)))
+}
+
+/// Refuses `buffers` if the memory of any two overlaps: two `&mut [u8]` over one byte would be
+/// undefined behaviour, whatever the reads then wrote. Empty buffers overlap nothing.
+///
+/// # Errors
+/// `BufferError` naming the two positions (in the caller's order) whose memory overlaps.
+fn check_disjoint(buffers: &[WritableBuffer]) -> PyResult<()> {
+    let mut ranges = Vec::with_capacity(buffers.len());
+    for (at, buffer) in buffers.iter().enumerate() {
+        if let Some(range) = buffer.address_range()? {
+            ranges.push((range, at));
+        }
+    }
+    ranges.sort_unstable_by_key(|(range, _)| range.start);
+    for pair in ranges.windows(2) {
+        let [(first, first_at), (second, second_at)] = pair else { continue };
+        if second.start < first.end {
+            return Err(PyBufferError::new_err(format!(
+                "destination buffers {first_at} and {second_at} overlap in memory; every request \
+                 needs a buffer of its own"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Runs `fill` on all bytes of every buffer of `objects`, in the same order, with the GIL released
+/// and the buffers held throughout. Every buffer is acquired and checked, and the set is proven
+/// free of overlapping memory, before the first slice is made.
+///
+/// # Errors
+/// As [`WritableBuffer::acquire`] for each object, `BufferError` if two buffers overlap (the same
+/// object twice, or two views of one array), and the exception of any core error of `fill`.
+pub(crate) fn fill_many_detached<F>(objects: &[Bound<'_, PyAny>], fill: F) -> PyResult<()>
+where
+    F: Send + FnOnce(Vec<&mut [u8]>) -> Result<(), Error>,
+{
+    let Some(first) = objects.first() else {
+        return Ok(());
+    };
+    let py = first.py();
+    let mut buffers = objects.iter().map(WritableBuffer::acquire).collect::<PyResult<Vec<_>>>()?;
+    check_disjoint(&buffers)?;
+    let dsts: Vec<&mut [u8]> = buffers.iter_mut().map(WritableBuffer::as_mut_slice).collect();
+    raised(py, py.detach(move || fill(dsts)))
 }

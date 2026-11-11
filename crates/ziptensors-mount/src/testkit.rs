@@ -3,18 +3,20 @@
 //!
 //! Main responsibilities: [`Scratch`], a unique directory under the system temp directory removed on
 //! drop; [`Fixture`], a container written by the public `PackBuilder` from seeded, safetensors-like
-//! files, with the bytes of every member for comparison.
+//! files, with the bytes of every member for comparison; [`OverlayFixture`], a model directory where
+//! some files are per-file containers (written by the public `encode_file`), for the overlay mount.
 //!
-//! Key structures: [`Scratch`], [`Fixture`].
+//! Key structures: [`Scratch`], [`Fixture`], [`OverlayFixture`].
 //!
-//! Implementation notes: also included by `tests/fuse.rs` through `#[path]`, so it names nothing of
-//! this crate. Data comes from splitmix64 with a fixed seed: no test reads a real model.
+//! Implementation notes: also included by `tests/fuse.rs` and `tests/winfsp.rs` through `#[path]`, so
+//! it names nothing of this crate. Data comes from splitmix64 with a fixed seed: no test reads a real
+//! model.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::{env, fs, process};
 
-use ziptensors_core::{EncodeOptions, Mode, PackBuilder};
+use ziptensors_core::{EncodeOptions, Mode, PackBuilder, encode_file};
 
 static NEXT_SCRATCH: AtomicU32 = AtomicU32::new(0);
 
@@ -101,6 +103,103 @@ impl Fixture {
     pub fn total_len(&self) -> u64 {
         self.files.iter().map(|(_, content)| u64::try_from(content.len()).expect("small")).sum()
     }
+}
+
+/// A model directory under a scratch directory, with what an overlay of it must show.
+#[derive(Debug)]
+pub struct OverlayFixture {
+    /// The directory to mount.
+    pub root: PathBuf,
+    /// Every file the overlay shows, `/`-separated, with its bytes, sorted by name.
+    pub shown: Vec<(String, Vec<u8>)>,
+    /// Every directory the overlay shows, `/`-separated, sorted.
+    pub dirs: Vec<String>,
+    /// Files on disk the overlay hides, `/`-separated: the container of a kept pair, and links.
+    pub hidden: Vec<String>,
+    /// The per-file containers, `/`-separated, sorted.
+    pub containers: Vec<String>,
+}
+
+impl OverlayFixture {
+    /// `scratch/tree` holding: `config.json` and `notes/readme.txt` as they are; three per-file
+    /// containers, `unet/diffusion_pytorch_model.ziptensors` (3 MiB, several chunks),
+    /// `text_encoder/deep/nested/model.ziptensors` and `weights.ziptensors` (raw bytes); a kept pair
+    /// `vae/model.safetensors` beside its container `vae/model.ziptensors`; a pack of two members
+    /// `pack.ziptensors`, shown as it is; an empty directory `empty`; and on Unix a link
+    /// `link.safetensors` to `config.json`, left out.
+    pub fn standard(scratch: &Scratch) -> Self {
+        let root = scratch.path().join("tree");
+        let config = b"{\"model\":\"overlay\"}\n".to_vec();
+        let readme = bytes(11, 5000);
+        let unet = safetensors(12, 3 << 19);
+        let vae = safetensors(13, 100 << 10);
+        let text = safetensors(14, 50 << 10);
+        let weights = bytes(15, 200 << 10);
+        let mut shown = vec![
+            ("config.json".to_owned(), config),
+            ("notes/readme.txt".to_owned(), readme),
+            ("unet/diffusion_pytorch_model.safetensors".to_owned(), unet),
+            ("vae/model.safetensors".to_owned(), vae),
+            ("text_encoder/deep/nested/model.safetensors".to_owned(), text),
+            ("weights.bin".to_owned(), weights),
+        ];
+        for (name, content) in &shown {
+            write_file(&root.join(name), content);
+        }
+        let containers = [
+            per_file(&root.join("unet/diffusion_pytorch_model.safetensors"), false),
+            per_file(&root.join("vae/model.safetensors"), true),
+            per_file(&root.join("text_encoder/deep/nested/model.safetensors"), false),
+            per_file(&root.join("weights.bin"), false),
+        ];
+        let pack = Fixture::build(scratch, &[("a.bin", 1000), ("b/c.bin", 2000)]);
+        let pack_bytes = fs::read(&pack.container).expect("read pack");
+        write_file(&root.join("pack.ziptensors"), &pack_bytes);
+        shown.push(("pack.ziptensors".to_owned(), pack_bytes));
+        fs::create_dir(root.join("empty")).expect("create empty directory");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("config.json", root.join("link.safetensors")).expect("create link");
+        let link = cfg!(unix).then_some("link.safetensors");
+        let hidden = ["vae/model.ziptensors"].into_iter().chain(link).map(str::to_owned).collect();
+        shown.sort();
+        let mut dirs: Vec<String> = ["empty", "notes", "text_encoder", "text_encoder/deep", "text_encoder/deep/nested", "unet", "vae"]
+            .map(str::to_owned)
+            .to_vec();
+        dirs.sort();
+        let mut containers: Vec<String> = containers
+            .iter()
+            .map(|path| {
+                let rel = path.strip_prefix(&root).expect("under the root");
+                rel.to_str().expect("UTF-8").replace('\\', "/")
+            })
+            .collect();
+        containers.sort();
+        Self { root, shown, dirs, hidden, containers }
+    }
+
+    /// The bytes the overlay shows under `name`.
+    pub fn content(&self, name: &str) -> &[u8] {
+        let found = self.shown.iter().find(|(shown, _)| shown == name);
+        &found.unwrap_or_else(|| panic!("{name} is not shown")).1
+    }
+}
+
+/// Writes `content` at `path`, creating its directories.
+fn write_file(path: &Path, content: &[u8]) {
+    fs::create_dir_all(path.parent().expect("a file in a directory")).expect("create directories");
+    fs::write(path, content).expect("write file");
+}
+
+/// Encodes `original` into a per-file container beside it (`<stem>.ziptensors`, member named after
+/// the file) and removes the original unless `keep`. Returns the container.
+pub fn per_file(original: &Path, keep: bool) -> PathBuf {
+    let container = original.with_extension("ziptensors");
+    let options = EncodeOptions { mode: Mode::Fast, threads: 2 };
+    encode_file(original, &container, &options).expect("encode a per-file container");
+    if !keep {
+        fs::remove_file(original).expect("remove the original");
+    }
+    container
 }
 
 /// `len` bytes from `seed` by splitmix64, with low-entropy runs so that the codecs have work.

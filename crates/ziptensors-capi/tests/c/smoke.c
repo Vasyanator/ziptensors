@@ -2,7 +2,8 @@
  * Purpose: a C caller of the shared library, built and run by tests/c_smoke.rs.
  *
  * Main responsibilities: encode and pack through the public header, read back by offset and by tensor
- * name into malloc'd memory, restore, and check an error path.
+ * name into malloc'd memory, describe and verify members, restore, edit and recover a pack, and check
+ * an error path.
  *
  * Usage: smoke <input> <tensor name> <scratch directory>. Exits 0 when every check passed, and writes
  * only under the scratch directory.
@@ -99,6 +100,8 @@ int main(int argc, char **argv) {
     unsigned char *source = read_file(input, &source_len);
 
     CHECK(zt_abi_version() == ZT_ABI_VERSION);
+    CHECK_OK(zt_enable_stderr_logging(ZT_LOG_LEVEL_ERROR));
+    CHECK_OK(zt_enable_stderr_logging(ZT_LOG_LEVEL_ERROR));
 
     /* One member, through the one-shot encoder. Fields left out take their defaults. */
     char *single = join(scratch, "single.ziptensors");
@@ -131,6 +134,18 @@ int main(int argc, char **argv) {
           ZT_STATUS_INVALID_ARGUMENT);
     CHECK(ZT_DTYPE_F32 == 0x0012 && ZT_DTYPE_Q8_0 == 0x0030);
 
+    /* What the index states about the member, and a full decode against its hash. */
+    zt_member_desc info;
+    memset(&info, 0xA5, sizeof info);
+    info.struct_size = sizeof info;
+    CHECK_OK(zt_member_info(container, 0, &info));
+    CHECK(info.len == source_len);
+    CHECK(info.profile == ZT_PROFILE_SAFETENSORS);
+    CHECK(info.tensor_count == 1);
+    info.struct_size = sizeof info - 1;
+    CHECK(zt_member_info(container, 0, &info) == ZT_STATUS_STRUCT_SIZE);
+    CHECK_OK(zt_member_verify(member));
+
     /* The member keeps the data alive past the container. */
     zt_close(container);
     check_bytes(member, source, source_len);
@@ -152,7 +167,42 @@ int main(int argc, char **argv) {
     CHECK_OK(zt_member_open(container, "models/second.bin", &member));
     check_bytes(member, source, source_len);
     zt_member_close(member);
+
+    /* Every member restored under a new directory. */
+    char *tree = join(scratch, "tree");
+    uint64_t restored_bytes = 0;
+    CHECK_OK(zt_restore_all(container, tree, &restored_bytes));
+    CHECK(restored_bytes == 2 * (uint64_t)source_len);
     zt_close(container);
+
+    /* An append that removes one member and adds another, then a refused kind and a check. */
+    zt_edit_op ops[2] = {
+        {.kind = ZT_EDIT_REMOVE, .name = "models/first.bin"},
+        {.kind = ZT_EDIT_ADD, .name = "models/third.bin", .path = input},
+    };
+    zt_edit_options edit = {
+        .struct_size = sizeof edit, .strategy = ZT_STRATEGY_APPEND, .mode = ZT_MODE_FAST, .threads = 1};
+    CHECK_OK(zt_edit(packed, ops, 2, &edit));
+    zt_edit_op bad = {.kind = 99, .name = "models/third.bin"};
+    CHECK(zt_edit(packed, &bad, 1, &edit) == ZT_STATUS_INVALID_ARGUMENT);
+    edit.repack = 1;
+    CHECK(zt_edit(packed, ops + 1, 1, &edit) == ZT_STATUS_EDIT_REFUSED);
+
+    CHECK_OK(zt_open(packed, NULL, &container));
+    CHECK_OK(zt_member_count(container, &member_count));
+    CHECK(member_count == 2);
+    CHECK_OK(zt_member_name(container, 1, &member_name, &member_name_len));
+    CHECK(strcmp(member_name, "models/third.bin") == 0);
+    CHECK_OK(zt_member_open(container, "models/third.bin", &member));
+    check_bytes(member, source, source_len);
+    zt_member_close(member);
+    zt_close(container);
+
+    /* The edited file opens as it is, so recovery keeps its whole length. */
+    zt_recover_options recover = {.struct_size = sizeof recover, .dry_run = 1};
+    uint64_t valid_len = 0;
+    CHECK_OK(zt_recover(packed, &recover, &valid_len));
+    CHECK(valid_len > 0);
 
     /* A failure, with the text sized by asking and then cut. */
     char *missing = join(scratch, "missing.ziptensors");
@@ -175,6 +225,7 @@ int main(int argc, char **argv) {
 
     free(text);
     free(missing);
+    free(tree);
     free(packed);
     free(restored);
     free(restored_path);

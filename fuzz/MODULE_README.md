@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Fuzz targets over the three surfaces that take untrusted bytes. Excluded from the workspace because it
+Fuzz targets over the four surfaces that take untrusted bytes. Excluded from the workspace because it
 needs nightly, with its own lockfile. The same functions run on stable through a seeded mutator in
 `crates/ziptensors-core/tests/malicious.rs`, so CI covers them without this crate.
 
@@ -16,16 +16,17 @@ needs nightly, with its own lockfile. The same functions run on stable through a
 
 | Path | Role |
 |---|---|
-| `src/harness.rs` | Targets, oracles, `assemble`, `sample`, `delta_sample`, `mutate`. May use only `ziptensors_core`, `zstd`, `blake3`, `xxhash_rust`, `std`. |
+| `src/harness.rs` | Targets, oracles, `assemble`, `sample`, `delta_sample`, `append_generation`, `mutate`. May use only `ziptensors_core`, `zstd`, `blake3`, `xxhash_rust`, `std`. |
 | `src/lib.rs` | Crate root. |
 | `src/bin/make_seeds.rs` | Writes the seed corpus to a directory it is given. |
-| `fuzz_targets/*.rs` | `open_and_read`, `decode_chunk`, `profile_scan`. |
+| `fuzz_targets/*.rs` | `open_and_read`, `decode_chunk`, `profile_scan`, `recover_scan`. |
 
 | Target | Surface | Input |
 |---|---|---|
 | `open_and_read` | `Container`, `Member` | Form byte, then file bytes, or `u32` length, data region and raw index. |
 | `decode_chunk` | `decode_chunk_into`, `encode_chunk`, and their delta forms | Chain, form, two length bytes, body. |
 | `profile_scan` | `profile::scan`, `normalize`, `width_trial` | A source file. |
+| `recover_scan` | `find_last_valid_generation` over `io::PrefixSource` | Form byte, then file bytes, or two `u32` lengths, data region, raw index and a tail after the assembled file. |
 
 ## Contracts and invariants
 
@@ -43,6 +44,13 @@ needs nightly, with its own lockfile. The same functions run on stable through a
 - Oracles beyond "no panic": whole, partial and `read_many` reads agree; `verify` passing means the bytes
   hash to the member; a decode does not depend on what its destination held, which is how a read ahead of
   the write head in the in-place route (risk R1) would show; guard bands around a chunk stay intact.
+- Recovery (spec section 9.3): `recover_scan` scans each file under a loose and a tight budget, the
+  tight byte bound taken from the form byte's top four bits. Oracles: no bound is exceeded; a found
+  generation opens as a prefix and carries its footer's `generation`; a tight scan that finds one finds
+  the loose scan's; a file that opens is found at its end; an assembled file that opens is never lost
+  behind its tail (an older result, or no result, is a finding). `open_and_read` is also seeded with
+  two-generation files from `append_generation`. Truncation and verification are file operations of
+  `recover`, tested in `ziptensors-core`, not fuzzed.
 - The harness runs under an index cap of 4 MiB, a budget of 64 MiB and at most 1 MiB per member, so an
   input costs milliseconds. The limits themselves are exercised in `tests/malicious.rs`.
 - Nothing generated stays in the tree. Corpus, artefacts and build output go to directories named on the

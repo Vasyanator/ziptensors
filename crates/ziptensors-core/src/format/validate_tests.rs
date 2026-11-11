@@ -708,6 +708,18 @@ fn inv10_budget_is_checked_over_the_members_to_decode() {
 }
 
 #[test]
+fn inv10_budget_error_reports_the_whole_sum_not_where_it_crossed() {
+    let index = Fixture::valid().check().expect("valid");
+    // The first member alone (26) crosses this limit; the error still names all three (30).
+    let limits = Limits { max_total_decoded: 10, ..Limits::default() };
+    let error = check_decode_budget(&index, 0..3, &limits).expect_err("over budget");
+    assert!(
+        matches!(error, Error::BudgetExceeded { what: "total decoded size", declared: 30, limit: 10 }),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn inv10_budget_sum_overflow_is_a_rejection_under_any_limit() {
     let mut fixture = Fixture::valid();
     fixture.members[0].file_len = u64::MAX;
@@ -1138,7 +1150,7 @@ fn random_valid_index(prng: &mut Prng) -> (Vec<u8>, Header, Footer, u64) {
             .expect("fits");
     }
     let raw = builder.serialize();
-    let footer = Footer::for_index(offset, 50, &raw);
+    let footer = Footer::for_index(offset, 50, &raw, crate::format::GENERATION_INITIAL);
     (raw, header, footer, offset + 50 + 64)
 }
 

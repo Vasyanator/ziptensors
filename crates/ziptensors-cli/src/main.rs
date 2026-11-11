@@ -16,12 +16,14 @@
 
 mod cli;
 mod commands;
+mod edit;
 mod errors;
 mod json;
 #[cfg(any(target_os = "linux", windows))]
 mod mount;
 mod pack;
 mod report;
+mod tree;
 
 use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;

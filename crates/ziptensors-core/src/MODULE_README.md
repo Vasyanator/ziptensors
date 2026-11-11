@@ -9,7 +9,8 @@ Frontends call its public API and own no decisions.
 
 Dependency direction is in the root `ARCHITECTURE.md`. In short: `read` and `write` compose `format`,
 `codec` and `io`; `write` also uses `profile`, and `read`, to prove its output before commit and to copy
-members; `read` never uses `write`; `error` and `types` are leaves.
+members; `edit` orchestrates `write` over a container `read` opened; `read` never uses `write` or
+`edit`, and `write` never uses `edit`; `error` and `types` are leaves.
 
 ## Files and submodules
 
@@ -25,6 +26,9 @@ members; `read` never uses `write`; `error` and `types` are leaves.
 | `profile/` | Source format recognition. |
 | `read/` | Reader API, and the opt-in decoded-window cache `ReadCache`. |
 | `write/` | Writer API. |
+| `edit/` | Editing an existing container: add, remove, replace, compaction, repack, by the rewrite or append commit. |
+| `tree/` | Per-file containers over a directory tree: `compress_tree`, `decompress_tree`, and the read-only `scan_view` the overlay mount uses. Depends on `write`, `read`, `profile`, `format`, `io`; nothing in core depends on it. |
+| `recover.rs`, `recover_tests.rs` | `recover`, the explicit tool of spec section 9.3 (scan backward for the latest valid generation, verify it and pass over to an older one if it fails, counting the candidates passed over in `RecoverReport::passed_over`, truncate, all through one handle opened once, so a file renamed over the path is never cut), and its read-only core `find_last_valid_generation`. Depends on `read`, `format`, `io`; nothing depends on it, and `Container::open` never recovers. |
 
 ## Contracts and invariants
 
@@ -46,3 +50,7 @@ members; `read` never uses `write`; `error` and `types` are leaves.
   geometry in `chain.rs`. Frontends take names from `Dtype::name` and block sizes from
   `Dtype::block_geometry`, and `ziptensors-capi` pins a `ZT_DTYPE_*` constant to each id.
 - New source format: `profile/`.
+- Edit operations, strategies and their refusals: `edit/`; how a file is ended stays in `write/commit.rs`.
+- Compressing or restoring a tree file by file (naming, collisions, pairs, links): `tree/`; the walk
+  itself is `write/inputs.rs`, the weight predicate `profile/`.
+- Recovery (scan bounds, which candidate failures stop the scan, verify-before-cut): `recover.rs`; its fuzz target is `recover_scan` in `fuzz/src/harness.rs`.

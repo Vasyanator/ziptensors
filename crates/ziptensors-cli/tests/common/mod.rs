@@ -151,7 +151,8 @@ pub fn hostile_pack(path: &Path, names: &[&str]) {
     let stored_len = u64::try_from(stored.len()).expect("a short index");
     let mut file = Header::current().to_bytes().to_vec();
     file.extend_from_slice(&stored);
-    file.extend_from_slice(&Footer::for_index(HEADER_LEN, stored_len, &raw).to_bytes());
+    let generation = ziptensors_core::format::GENERATION_INITIAL;
+    file.extend_from_slice(&Footer::for_index(HEADER_LEN, stored_len, &raw, generation).to_bytes());
     assert_eq!(u64::try_from(file.len()).ok(), Some(HEADER_LEN + stored_len + FOOTER_LEN));
     fs::write(path, file).expect("write hostile pack");
 }

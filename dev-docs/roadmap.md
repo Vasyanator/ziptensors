@@ -134,3 +134,31 @@ The calling thread reads a batch, then waits for its decode, so 12 threads decod
 while batch n decodes would lift that, at the cost of a second batch buffer in the read bound. On
 Windows the pool dispatch also costs 0.1-0.2 ms per random 1 MiB read (1 thread is faster than 12
 there); decoding a read of one or two chunks inline would remove it.
+
+## 6. Shared repository for per-file containers (`__ziptensors_repository__`)
+
+Goal: a directory compressed file by file (each weight file its own container, configs untouched) that
+still deduplicates and delta-encodes across files. Shared blobs (identical tensors such as a VAE or text
+encoder repeated across SDXL finetunes, delta bases) live in one `__ziptensors_repository__` file at the
+directory root; each container references it by relative path and by the repository's identity hash,
+so a moved, replaced or stale repository is an error, never wrong bytes.
+
+- Format: the reserved required feature "multi-volume" (bit 2) as a 0.x minor; an older reader refuses
+  such a container. Extents may reach blobs of the referenced volume.
+- Consequence: a container is no longer self-contained; only the whole directory is a distributable
+  unit. `inspect` and every open error must say so.
+- Open design: garbage collection when a container is deleted (reference counts kept in the repository
+  vs. a `repo gc` that walks the directory; a container deleted by hand is invisible to the
+  repository); appending a new model's blobs to the repository through the append protocol, with a lock
+  against two writers; `decompress -r` restores every container before it removes the repository.
+- Experiment first: cross-file duplicate bytes in typical model folders (SDXL finetune collections,
+  diffusers directories with F32 and FP16 variants) against per-file compression alone.
+
+## 7. Splitting a container into parts
+
+Goal: one logical container stored as several files of bounded size (e.g. below 4 GiB for FAT32 and
+some upload limits, below 50 GB for model hubs), named `<name>.ziptensors.partNNN` or similar, readable
+without joining them. Shares the "multi-volume" feature with section 6: extents name a volume and an
+offset within it. Open design: whether the index lives in the last part or in every part, how a reader
+finds and validates sibling parts (count, identity hash per part), and how `mount` and `restore` treat a
+missing part (typed error naming it).

@@ -20,16 +20,19 @@ use std::ptr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::thread;
 
-use ziptensors_core::{Dtype, ErrorCode};
+use ziptensors_core::format::{FOOTER_LEN, Footer, HEADER_LEN, Header, IndexBuilder, MemberRecord};
+use ziptensors_core::{Dtype, ErrorCode, Profile};
 
 use crate::barrier::panic_on_next_entry;
 use crate::{
-    ZT_ABI_VERSION, ZtContainer, ZtEncodeOptions, ZtMember, ZtMode, ZtOpenOptions, ZtPack, ZtStatus,
-    ZtTensorDesc, ZtVerify, zt_abi_version, zt_close, zt_decode_tensor_into, zt_encode_file,
-    zt_last_error, zt_member_close, zt_member_count, zt_member_len, zt_member_name, zt_member_open,
-    zt_open, zt_pack_add_file,
-    zt_pack_finish, zt_pack_free, zt_pack_new, zt_read_at, zt_restore_file, zt_tensor_count,
-    zt_tensor_info,
+    ZT_ABI_VERSION, ZT_EDIT_ADD, ZT_EDIT_REMOVE, ZT_EDIT_REPLACE, ZtContainer, ZtEditOp,
+    ZtEditOptions, ZtEncodeOptions, ZtLogLevel, ZtMember, ZtMemberDesc, ZtMode, ZtOpenOptions,
+    ZtPack, ZtRecoverOptions, ZtStatus, ZtStrategy, ZtTensorDesc, ZtVerify, zt_abi_version,
+    zt_close, zt_decode_tensor_into, zt_edit, zt_enable_stderr_logging, zt_encode_file,
+    zt_last_error, zt_member_close, zt_member_count, zt_member_info, zt_member_len, zt_member_name,
+    zt_member_open, zt_member_verify, zt_open, zt_pack_add_file, zt_pack_add_file_delta,
+    zt_pack_add_member_from, zt_pack_finish, zt_pack_free, zt_pack_new, zt_read_at, zt_recover,
+    zt_restore_all, zt_restore_file, zt_tensor_count, zt_tensor_info,
 };
 
 /// A unique directory under the system temp directory, removed when dropped.
@@ -226,6 +229,12 @@ fn every_error_code_has_the_status_of_the_same_value() {
         ErrorCode::SymlinkInput,
         ErrorCode::OutputIsInput,
         ErrorCode::CommittedNotDurable,
+        ErrorCode::DamagedInPlace,
+        ErrorCode::EditRefused,
+        ErrorCode::TrailingBytes,
+        ErrorCode::Unrecoverable,
+        ErrorCode::TreeConflict,
+        ErrorCode::DuplicateMember,
     ];
     for code in codes {
         assert_eq!(ZtStatus::from_code(code) as i32, code.as_i32(), "{code:?}");
@@ -487,6 +496,9 @@ fn null_arguments_are_named() {
     let dst = &raw mut byte;
     let null: *const c_char = ptr::null();
     let mut desc = MaybeUninit::<ZtTensorDesc>::uninit();
+    let mut info = member_desc();
+    let mut bytes = 0_u64;
+    let op = ZtEditOp { kind: ZT_EDIT_REMOVE, name: path, path: null, delta_base: null };
     // SAFETY: every pointer is NULL or valid, and NULL is what these calls must survive.
     let calls = unsafe {
         [
@@ -513,6 +525,16 @@ fn null_arguments_are_named() {
             (zt_pack_new(path, ptr::null(), ptr::null_mut()), "out"),
             (zt_pack_add_file(ptr::null_mut(), path, path), "pack"),
             (zt_pack_finish(ptr::null_mut()), "pack"),
+            (zt_member_info(ptr::null(), 0, &raw mut info), "container"),
+            (zt_member_info(container, 0, ptr::null_mut()), "out"),
+            (zt_member_verify(ptr::null()), "member"),
+            (zt_restore_all(ptr::null(), path, &raw mut bytes), "container"),
+            (zt_restore_all(container, null, &raw mut bytes), "dir"),
+            (zt_pack_add_file_delta(ptr::null_mut(), path, path, path), "pack"),
+            (zt_pack_add_member_from(ptr::null_mut(), container, path), "pack"),
+            (zt_edit(null, &raw const op, 1, ptr::null()), "container"),
+            (zt_edit(path, ptr::null(), 1, ptr::null()), "ops"),
+            (zt_recover(null, ptr::null(), &raw mut bytes), "container"),
         ]
     };
     for (index, (status, argument)) in calls.into_iter().enumerate() {
@@ -894,7 +916,7 @@ fn a_pack_refuses_what_core_refuses_and_goes_on() {
     assert_eq!(status, ZtStatus::Ok, "{}", last_error());
     // SAFETY: as above.
     let status = unsafe { zt_pack_add_file(pack, input, c"good".as_ptr()) };
-    assert_fails(status, ZtStatus::MalformedIndex, "used twice");
+    assert_fails(status, ZtStatus::DuplicateMember, "used twice");
     let missing = fixture.scratch.path("missing");
     // SAFETY: as above.
     let status = unsafe { zt_pack_add_file(pack, missing.as_ptr(), c"other".as_ptr()) };
@@ -943,6 +965,8 @@ fn every_status_entry_stops_a_panic() {
     let mut member_out = ptr::null_mut();
     let mut pack_out = ptr::null_mut();
     let null: *const c_char = ptr::null();
+    let mut info = member_desc();
+    let mut bytes = 0_u64;
     // SAFETY: arguments of every call below are valid, and the injected panic comes before any of
     // them is used.
     unsafe {
@@ -959,7 +983,15 @@ fn every_status_entry_stops_a_panic() {
         assert_barrier_holds(|| zt_pack_new(path, null.cast(), &raw mut pack_out));
         assert_barrier_holds(|| zt_pack_add_file(ptr::null_mut(), path, path));
         assert_barrier_holds(|| zt_pack_finish(ptr::null_mut()));
+        assert_barrier_holds(|| zt_member_info(container, 0, &raw mut info));
+        assert_barrier_holds(|| zt_member_verify(member));
+        assert_barrier_holds(|| zt_restore_all(container, path, &raw mut bytes));
+        assert_barrier_holds(|| zt_pack_add_file_delta(ptr::null_mut(), path, path, path));
+        assert_barrier_holds(|| zt_pack_add_member_from(ptr::null_mut(), container, path));
+        assert_barrier_holds(|| zt_edit(path, ptr::null(), 0, ptr::null()));
+        assert_barrier_holds(|| zt_recover(path, ptr::null(), &raw mut bytes));
     }
+    assert_barrier_holds(|| zt_enable_stderr_logging(ZtLogLevel::Error as i32));
     close(container, member);
 }
 
@@ -1006,4 +1038,496 @@ fn a_panic_in_a_pack_call_ends_the_pack() {
     assert_fails(status, ZtStatus::InvalidState, "panicked");
     // SAFETY: a live handle, not used again.
     unsafe { zt_pack_free(pack) };
+}
+
+/// A `zt_member_desc` with its size set and every other field a marker, as a caller passes it.
+fn member_desc() -> ZtMemberDesc {
+    ZtMemberDesc {
+        struct_size: size_of::<ZtMemberDesc>(),
+        len: 7,
+        blake3: [0xA5; 32],
+        profile: 0xEE,
+        tensor_count: 7,
+    }
+}
+
+/// The names of the members of the container at `path`, in file order.
+fn member_names(path: &CStr) -> Vec<String> {
+    let container = open(path);
+    let mut count = 0;
+    // SAFETY: the handle is live and the slot is writable.
+    assert_eq!(unsafe { zt_member_count(container, &raw mut count) }, ZtStatus::Ok);
+    let names = (0..count)
+        .map(|index| {
+            let (mut name, mut name_len) = (ptr::null(), 0);
+            // SAFETY: the handle is live and the slots are writable.
+            let status = unsafe { zt_member_name(container, index, &raw mut name, &raw mut name_len) };
+            assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+            // SAFETY: the name is NUL-terminated and lives as long as `container`.
+            unsafe { CStr::from_ptr(name) }.to_str().expect("UTF-8").to_owned()
+        })
+        .collect();
+    // SAFETY: a live handle, not used again.
+    unsafe { zt_close(container) };
+    names
+}
+
+/// Reads the whole member `name` of the container at `path`.
+fn member_bytes(path: &CStr, name: &CStr) -> Vec<u8> {
+    let container = open(path);
+    let mut member = ptr::null_mut();
+    // SAFETY: the handle and the string are live, and the slot is writable.
+    let status = unsafe { zt_member_open(container, name.as_ptr(), &raw mut member) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    let mut len = 0_u64;
+    // SAFETY: the handle is live and the slot is writable.
+    assert_eq!(unsafe { zt_member_len(member, &raw mut len) }, ZtStatus::Ok);
+    let mut dst = vec![0; usize::try_from(len).expect("small")];
+    // SAFETY: the handle is live and `dst` holds `dst.len()` bytes.
+    let status = unsafe { zt_read_at(member, 0, dst.as_mut_ptr(), dst.len()) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    close(container, member);
+    dst
+}
+
+#[test]
+fn profile_constants_are_the_ids_of_core() {
+    let pairs = [
+        (crate::ZT_PROFILE_OPAQUE, Profile::Opaque),
+        (crate::ZT_PROFILE_SAFETENSORS, Profile::Safetensors),
+        (crate::ZT_PROFILE_GGUF, Profile::Gguf),
+        (crate::ZT_PROFILE_ONNX, Profile::Onnx),
+        (crate::ZT_PROFILE_PT_ZIP, Profile::PtZip),
+    ];
+    for (id, profile) in pairs {
+        assert_eq!(Profile::from_wire(id), profile);
+    }
+    let registered =
+        (0..=u8::MAX).filter(|&id| !matches!(Profile::from_wire(id), Profile::Unknown(_))).count();
+    assert_eq!(pairs.len(), registered);
+}
+
+#[test]
+fn member_info_states_the_index_record() {
+    let fixture = Fixture::new();
+    let (container, member) = fixture.open();
+    let mut info = member_desc();
+    // SAFETY: the handle is live and `info` is writable, with its size set.
+    let status = unsafe { zt_member_info(container, 0, &raw mut info) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(info.struct_size, size_of::<ZtMemberDesc>());
+    assert_eq!(info.len, u64::try_from(fixture.source.len()).expect("small"));
+    assert_eq!(info.blake3, *blake3::hash(&fixture.source).as_bytes());
+    assert_eq!(info.profile, crate::ZT_PROFILE_SAFETENSORS);
+    assert_eq!(info.tensor_count, 2);
+    // SAFETY: the handle is live.
+    assert_eq!(unsafe { zt_member_verify(member) }, ZtStatus::Ok, "{}", last_error());
+
+    // A refused call leaves the struct as it was.
+    let mut untouched = member_desc();
+    // SAFETY: as above.
+    let status = unsafe { zt_member_info(container, 1, &raw mut untouched) };
+    assert_fails(status, ZtStatus::InvalidArgument, "member 1 of 1");
+    assert_eq!(untouched.len, 7);
+    for wrong in [0, size_of::<ZtMemberDesc>() - 8, size_of::<ZtMemberDesc>() + 8] {
+        untouched.struct_size = wrong;
+        // SAFETY: as above.
+        let status = unsafe { zt_member_info(container, 0, &raw mut untouched) };
+        assert_fails(status, ZtStatus::StructSize, "struct_size");
+        assert_eq!((untouched.len, untouched.profile), (7, 0xEE));
+    }
+    close(container, member);
+}
+
+#[test]
+fn verify_reports_a_damaged_member() {
+    let fixture = Fixture::new();
+    let mut bytes = fs::read(fixture.scratch.0.join("single.ziptensors")).expect("read");
+    // A byte in the stored chunks, past the header and well before the index and footer.
+    let at = usize::try_from(HEADER_LEN).expect("small") + 200;
+    bytes[at] ^= 0xFF;
+    fs::write(fixture.scratch.0.join("damaged.ziptensors"), &bytes).expect("write");
+    let damaged = fixture.scratch.path("damaged.ziptensors");
+    let options = ZtOpenOptions { verify: ZtVerify::Off as i32, ..open_options() };
+    let mut container = ptr::null_mut();
+    // SAFETY: the string and the struct are live, and the slot is writable.
+    let status = unsafe { zt_open(damaged.as_ptr(), &raw const options, &raw mut container) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    let mut member = ptr::null_mut();
+    // SAFETY: the handle is live and the slot is writable.
+    let status = unsafe { zt_member_open(container, ptr::null(), &raw mut member) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    // SAFETY: the handle is live.
+    let status = unsafe { zt_member_verify(member) };
+    assert_ne!(status, ZtStatus::Ok);
+    assert!(status as i32 > 0, "{status:?}: {}", last_error());
+    close(container, member);
+}
+
+#[test]
+fn restore_all_writes_every_member() {
+    let fixture = Fixture::new();
+    let output = fixture.scratch.path("pack.ziptensors");
+    pack_two(&fixture, &output);
+    let container = open(&output);
+    let dir = fixture.scratch.path("out/deep");
+    let mut bytes = 0_u64;
+    // SAFETY: the handle and the string are live, and the slot is writable.
+    let status = unsafe { zt_restore_all(container, dir.as_ptr(), &raw mut bytes) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(bytes, 2 * u64::try_from(fixture.source.len()).expect("small"));
+    for name in ["one", "dir/two"] {
+        let restored = fs::read(fixture.scratch.0.join("out/deep").join(name)).expect("restored");
+        assert_eq!(restored, fixture.source, "{name}");
+    }
+    let again = fixture.scratch.path("again");
+    // SAFETY: as above; NULL is allowed for `bytes_out`.
+    let status = unsafe { zt_restore_all(container, again.as_ptr(), ptr::null_mut()) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    // SAFETY: a live handle, not used again.
+    unsafe { zt_close(container) };
+}
+
+/// BLAKE3 of no bytes.
+const EMPTY_BLAKE3: [u8; 32] = [
+    0xaf, 0x13, 0x49, 0xb9, 0xf5, 0xf9, 0xa1, 0xa6, 0xa0, 0x40, 0x4d, 0xea, 0x36, 0xdc, 0xc9, 0x49,
+    0x9b, 0xcb, 0x25, 0xc9, 0xad, 0xc1, 0x12, 0xb7, 0xcc, 0x9a, 0x93, 0xca, 0xe4, 0x1f, 0x32, 0x62,
+];
+
+/// Writes a valid container of empty members called `names`, which no writer would accept: the index
+/// is built by hand, as only a hostile file has such names.
+fn hostile_pack(path: &Path, names: &[&str]) {
+    let mut index = IndexBuilder::new();
+    for name in names {
+        let name = index.add_string(name).expect("add name");
+        let member = MemberRecord {
+            name,
+            file_len: 0,
+            blake3: EMPTY_BLAKE3,
+            first_extent: 0,
+            extent_count: 0,
+            first_tensor: 0,
+            tensor_count: 0,
+            profile: Profile::Opaque,
+        };
+        index.add_member(member).expect("add member");
+    }
+    let raw = index.serialize();
+    let stored = zstd::bulk::compress(&raw, 3).expect("compress index");
+    let stored_len = u64::try_from(stored.len()).expect("a short index");
+    let mut file = Header::current().to_bytes().to_vec();
+    file.extend_from_slice(&stored);
+    let generation = ziptensors_core::format::GENERATION_INITIAL;
+    file.extend_from_slice(&Footer::for_index(HEADER_LEN, stored_len, &raw, generation).to_bytes());
+    assert_eq!(u64::try_from(file.len()).ok(), Some(HEADER_LEN + stored_len + FOOTER_LEN));
+    fs::write(path, file).expect("write hostile pack");
+}
+
+#[test]
+fn restore_all_with_a_hostile_name_creates_nothing() {
+    assert_eq!(blake3::hash(b"").as_bytes(), &EMPTY_BLAKE3);
+    for name in ["../escaped.bin", "/abs.bin", "a/../../x"] {
+        let scratch = Scratch::new();
+        hostile_pack(&scratch.0.join("hostile.ziptensors"), &["fine.bin", name]);
+        let container = open(&scratch.path("hostile.ziptensors"));
+        let dir = scratch.path("deep/out");
+        let mut bytes = 99_u64;
+        // SAFETY: the handle and the string are live, and the slot is writable.
+        let status = unsafe { zt_restore_all(container, dir.as_ptr(), &raw mut bytes) };
+        assert_fails(status, ZtStatus::UnsafeMemberName, name);
+        assert_eq!(ZtStatus::UnsafeMemberName as i32, 14);
+        assert_eq!(bytes, 99, "{name}");
+        assert_eq!(scratch.listing(), ["hostile.ziptensors"], "{name}");
+        // SAFETY: a live handle, not used again.
+        unsafe { zt_close(container) };
+    }
+}
+
+#[test]
+fn a_pack_stores_a_file_against_a_delta_base() {
+    let fixture = Fixture::new();
+    // The second input differs from the first in a few bytes of `alpha`.
+    let mut changed = fixture.source.clone();
+    changed[fixture.payload_at + 10] ^= 0x01;
+    fs::write(fixture.scratch.0.join("changed.safetensors"), &changed).expect("write");
+    let changed_path = fixture.scratch.path("changed.safetensors");
+    let output = fixture.scratch.path("pack.ziptensors");
+    let options = encode_options(ZtMode::Max);
+    let mut pack = ptr::null_mut();
+    // SAFETY: the strings and the struct are live, and the slot is writable.
+    let status = unsafe { zt_pack_new(output.as_ptr(), &raw const options, &raw mut pack) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    // SAFETY: the handle and the strings are live, for every call below.
+    unsafe {
+        let status = zt_pack_add_file_delta(pack, changed_path.as_ptr(), c"b".as_ptr(), c"a".as_ptr());
+        assert_fails(status, ZtStatus::MemberNotFound, "a");
+        let status = zt_pack_add_file(pack, fixture.input.as_ptr(), c"a".as_ptr());
+        assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+        let status = zt_pack_add_file_delta(pack, changed_path.as_ptr(), c"b".as_ptr(), c"a".as_ptr());
+        assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+        let status = zt_pack_add_file_delta(pack, changed_path.as_ptr(), c"c".as_ptr(), ptr::null());
+        assert_fails(status, ZtStatus::NullArgument, "base_member");
+        assert_eq!(zt_pack_finish(pack), ZtStatus::Ok, "{}", last_error());
+        zt_pack_free(pack);
+    }
+    assert_eq!(member_bytes(&output, c"a"), fixture.source);
+    assert_eq!(member_bytes(&output, c"b"), changed);
+}
+
+#[test]
+fn a_pack_copies_a_member_of_another_container() {
+    let fixture = Fixture::new();
+    let first = fixture.scratch.path("first.ziptensors");
+    pack_two(&fixture, &first);
+    let source = open(&first);
+    let output = fixture.scratch.path("copy.ziptensors");
+    let mut pack = ptr::null_mut();
+    // SAFETY: the strings are live, the slot is writable, and NULL options are allowed.
+    let status = unsafe { zt_pack_new(output.as_ptr(), ptr::null(), &raw mut pack) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    // SAFETY: the handles and the strings are live, for every call below.
+    unsafe {
+        let status = zt_pack_add_member_from(pack, source, c"nope".as_ptr());
+        assert_fails(status, ZtStatus::MemberNotFound, "nope");
+        let status = zt_pack_add_member_from(pack, ptr::null(), c"dir/two".as_ptr());
+        assert_fails(status, ZtStatus::NullArgument, "source");
+        let status = zt_pack_add_member_from(pack, source, c"dir/two".as_ptr());
+        assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+        // The pack keeps what it copied: the source may close before the finish.
+        zt_close(source);
+        assert_eq!(zt_pack_finish(pack), ZtStatus::Ok, "{}", last_error());
+        zt_pack_free(pack);
+    }
+    assert_eq!(member_names(&output), ["dir/two"]);
+    assert_eq!(member_bytes(&output, c"dir/two"), fixture.source);
+}
+
+fn edit_options(strategy: ZtStrategy) -> ZtEditOptions {
+    ZtEditOptions {
+        struct_size: size_of::<ZtEditOptions>(),
+        strategy: strategy as i32,
+        repack: 0,
+        mode: ZtMode::Fast as i32,
+        threads: 1,
+        max_total_decoded: 0,
+    }
+}
+
+/// An operation with the strings given, NULL for `None`.
+fn op(kind: i32, name: &CStr, path: Option<&CStr>, delta_base: Option<&CStr>) -> ZtEditOp {
+    ZtEditOp {
+        kind,
+        name: name.as_ptr(),
+        path: path.map_or(ptr::null(), CStr::as_ptr),
+        delta_base: delta_base.map_or(ptr::null(), CStr::as_ptr),
+    }
+}
+
+#[test]
+fn edit_applies_every_kind_under_every_strategy() {
+    let fixture = Fixture::new();
+    let output = fixture.scratch.path("pack.ziptensors");
+    pack_two(&fixture, &output);
+    let mut changed = fixture.source.clone();
+    changed[fixture.payload_at] ^= 0x80;
+    fs::write(fixture.scratch.0.join("changed.bin"), &changed).expect("write");
+    let changed_path = fixture.scratch.path("changed.bin");
+
+    let input = Some(fixture.input.as_c_str());
+    let ops = [op(ZT_EDIT_REMOVE, c"one", None, None), op(ZT_EDIT_ADD, c"three", input, None)];
+    let options = edit_options(ZtStrategy::Append);
+    // SAFETY: the strings, the array and the struct are live.
+    let status = unsafe { zt_edit(output.as_ptr(), ops.as_ptr(), ops.len(), &raw const options) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(member_names(&output), ["dir/two", "three"]);
+    assert_eq!(member_bytes(&output, c"three"), fixture.source);
+
+    let replace = [op(ZT_EDIT_REPLACE, c"dir/two", Some(changed_path.as_c_str()), Some(c"three"))];
+    // SAFETY: as above; NULL options are allowed.
+    let status = unsafe { zt_edit(output.as_ptr(), replace.as_ptr(), 1, ptr::null()) };
+    assert_fails(status, ZtStatus::EditRefused, "after");
+    let replace = [op(ZT_EDIT_REPLACE, c"dir/two", Some(changed_path.as_c_str()), None)];
+    // SAFETY: as above.
+    let status = unsafe { zt_edit(output.as_ptr(), replace.as_ptr(), 1, ptr::null()) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(member_names(&output), ["dir/two", "three"]);
+    assert_eq!(member_bytes(&output, c"dir/two"), changed);
+
+    // No operation compacts: in place too.
+    let options = edit_options(ZtStrategy::InPlace);
+    // SAFETY: as above; NULL `ops` is allowed with a count of 0.
+    let status = unsafe { zt_edit(output.as_ptr(), ptr::null(), 0, &raw const options) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(member_bytes(&output, c"three"), fixture.source);
+
+    // A repack rewrites every member.
+    let options = ZtEditOptions { repack: 1, ..edit_options(ZtStrategy::Rewrite) };
+    // SAFETY: as above.
+    let status = unsafe { zt_edit(output.as_ptr(), ptr::null(), 0, &raw const options) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(member_bytes(&output, c"dir/two"), changed);
+}
+
+#[test]
+fn edit_refuses_bad_requests_and_leaves_the_file() {
+    let fixture = Fixture::new();
+    let output = fixture.scratch.path("pack.ziptensors");
+    pack_two(&fixture, &output);
+    let before = fs::read(fixture.scratch.0.join("pack.ziptensors")).expect("read");
+    let input = Some(fixture.input.as_c_str());
+    let edit = |ops: &[ZtEditOp], options: &ZtEditOptions| {
+        // SAFETY: the strings, the array and the struct are live.
+        unsafe { zt_edit(output.as_ptr(), ops.as_ptr(), ops.len(), options) }
+    };
+    let rewrite = edit_options(ZtStrategy::Rewrite);
+    let add = op(ZT_EDIT_ADD, c"new", input, None);
+
+    let bad_kind = ZtEditOp { kind: 0, ..add };
+    assert_fails(edit(&[add, bad_kind], &rewrite), ZtStatus::InvalidArgument, "operation 1");
+    let bad_kind = ZtEditOp { kind: 77, name: ptr::null(), ..add };
+    assert_fails(edit(&[bad_kind], &rewrite), ZtStatus::InvalidArgument, "kind 77");
+    let no_name = ZtEditOp { name: ptr::null(), ..add };
+    assert_fails(edit(&[no_name], &rewrite), ZtStatus::NullArgument, "operation 0: argument `name`");
+    let no_path = ZtEditOp { path: ptr::null(), ..add };
+    assert_fails(edit(&[no_path], &rewrite), ZtStatus::NullArgument, "`path`");
+    let bad_utf8 = ZtEditOp { delta_base: c"\xFF".as_ptr(), ..add };
+    assert_fails(edit(&[bad_utf8], &rewrite), ZtStatus::InvalidUtf8, "`delta_base`");
+    let remove_with_path = op(ZT_EDIT_REMOVE, c"one", input, None);
+    assert_fails(edit(&[remove_with_path], &rewrite), ZtStatus::InvalidArgument, "takes no");
+
+    let append_repack = ZtEditOptions { repack: 1, ..edit_options(ZtStrategy::Append) };
+    assert_fails(edit(&[add], &append_repack), ZtStatus::EditRefused, "repack");
+    let in_place_repack = ZtEditOptions { repack: 1, ..edit_options(ZtStrategy::InPlace) };
+    assert_fails(edit(&[add], &in_place_repack), ZtStatus::EditRefused, "repack");
+    assert_fails(edit(&[], &edit_options(ZtStrategy::Append)), ZtStatus::EditRefused, "");
+    let twice = [op(ZT_EDIT_REMOVE, c"one", None, None), op(ZT_EDIT_REMOVE, c"one", None, None)];
+    assert_fails(edit(&twice, &rewrite), ZtStatus::EditRefused, "one");
+    let missing = [op(ZT_EDIT_REMOVE, c"nope", None, None)];
+    assert_fails(edit(&missing, &rewrite), ZtStatus::MemberNotFound, "nope");
+    let hostile = [op(ZT_EDIT_ADD, c"../evil", input, None)];
+    assert_fails(edit(&hostile, &rewrite), ZtStatus::UnsafeMemberName, "evil");
+
+    let unknown_strategy = ZtEditOptions { strategy: 9, ..rewrite };
+    assert_fails(edit(&[add], &unknown_strategy), ZtStatus::InvalidArgument, "zt_strategy");
+    let bad_flag = ZtEditOptions { repack: 2, ..rewrite };
+    assert_fails(edit(&[add], &bad_flag), ZtStatus::InvalidArgument, "`repack`");
+    let bad_mode = ZtEditOptions { mode: 9, ..rewrite };
+    assert_fails(edit(&[add], &bad_mode), ZtStatus::InvalidArgument, "zt_mode");
+    let wrong_size = ZtEditOptions { struct_size: 8, ..rewrite };
+    assert_fails(edit(&[add], &wrong_size), ZtStatus::StructSize, "struct_size");
+    let budget = ZtEditOptions { max_total_decoded: 1, ..rewrite };
+    assert_fails(edit(&[add], &budget), ZtStatus::BudgetExceeded, "");
+    let byte = 0_u8;
+    // SAFETY: the count is refused before the pointer is used.
+    let status = unsafe { zt_edit(output.as_ptr(), (&raw const byte).cast(), usize::MAX, ptr::null()) };
+    assert_fails(status, ZtStatus::InvalidArgument, "`count`");
+
+    assert_eq!(fs::read(fixture.scratch.0.join("pack.ziptensors")).expect("read"), before);
+    assert_eq!(fixture.scratch.listing(), ["input.safetensors", "pack.ziptensors", "single.ziptensors"]);
+}
+
+fn recover_options() -> ZtRecoverOptions {
+    ZtRecoverOptions {
+        struct_size: size_of::<ZtRecoverOptions>(),
+        dry_run: 0,
+        skip_verify: 0,
+        max_candidates: 0,
+        max_scan_bytes: 0,
+        max_total_decoded: 0,
+    }
+}
+
+#[test]
+fn recover_cuts_a_torn_tail() {
+    let fixture = Fixture::new();
+    let file = fixture.scratch.0.join("single.ziptensors");
+    let valid = fs::read(&file).expect("read");
+    let valid_len = u64::try_from(valid.len()).expect("small");
+    let mut torn = valid.clone();
+    torn.extend_from_slice(&noise(1000));
+    fs::write(&file, &torn).expect("write");
+    let mut slot = ptr::null_mut();
+    // SAFETY: the string is live and the slot is writable.
+    let status = unsafe { zt_open(fixture.output.as_ptr(), ptr::null(), &raw mut slot) };
+    assert_ne!(status, ZtStatus::Ok);
+
+    let dry = ZtRecoverOptions { dry_run: 1, ..recover_options() };
+    let mut found = 0_u64;
+    // SAFETY: the string and the struct are live, and the slot is writable.
+    let status = unsafe { zt_recover(fixture.output.as_ptr(), &raw const dry, &raw mut found) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(found, valid_len);
+    assert_eq!(fs::read(&file).expect("read"), torn);
+
+    let mut cut = 0_u64;
+    let options = recover_options();
+    // SAFETY: as above.
+    let status = unsafe { zt_recover(fixture.output.as_ptr(), &raw const options, &raw mut cut) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    assert_eq!(cut, valid_len);
+    assert_eq!(fs::read(&file).expect("read"), valid);
+    let (container, member) = fixture.open();
+    close(container, member);
+
+    // A valid file is left alone, with NULL options and no output wanted.
+    // SAFETY: the string is live, and NULL is allowed for both.
+    let status = unsafe { zt_recover(fixture.output.as_ptr(), ptr::null(), ptr::null_mut()) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    let skip = ZtRecoverOptions {
+        skip_verify: 1,
+        max_candidates: 1,
+        max_scan_bytes: 1 << 20,
+        ..recover_options()
+    };
+    // SAFETY: as above.
+    let status = unsafe { zt_recover(fixture.output.as_ptr(), &raw const skip, ptr::null_mut()) };
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+}
+
+#[test]
+fn recover_refuses_what_it_cannot_judge() {
+    let fixture = Fixture::new();
+    fs::write(fixture.scratch.0.join("plain"), noise(4096)).expect("write");
+    let plain = fixture.scratch.path("plain");
+    let mut found = 7_u64;
+    // SAFETY: the string is live, NULL options are allowed, and the slot is writable.
+    let status = unsafe { zt_recover(plain.as_ptr(), ptr::null(), &raw mut found) };
+    assert_fails(status, ZtStatus::NotZiptensors, "");
+    assert_eq!(found, 7);
+
+    let output = fixture.output.as_ptr();
+    for (options, needle) in [
+        (ZtRecoverOptions { dry_run: -1, ..recover_options() }, "`dry_run`"),
+        (ZtRecoverOptions { skip_verify: 2, ..recover_options() }, "`skip_verify`"),
+        (ZtRecoverOptions { struct_size: 0, ..recover_options() }, "struct_size"),
+    ] {
+        // SAFETY: the string and the struct are live, and the slot is writable.
+        let status = unsafe { zt_recover(output, &raw const options, &raw mut found) };
+        let expected =
+            if needle == "struct_size" { ZtStatus::StructSize } else { ZtStatus::InvalidArgument };
+        assert_fails(status, expected, needle);
+        assert_eq!(found, 7);
+    }
+
+    // The torn copy, with nothing valid in reach of a scan of a few bytes.
+    let mut torn = fs::read(fixture.scratch.0.join("single.ziptensors")).expect("read");
+    torn.extend_from_slice(&noise(3 << 20));
+    fs::write(fixture.scratch.0.join("torn"), &torn).expect("write");
+    let torn_path = fixture.scratch.path("torn");
+    let tight = ZtRecoverOptions { max_scan_bytes: 4096, ..recover_options() };
+    // SAFETY: as above.
+    let status = unsafe { zt_recover(torn_path.as_ptr(), &raw const tight, &raw mut found) };
+    assert_fails(status, ZtStatus::Unrecoverable, "");
+    assert_eq!(fs::read(fixture.scratch.0.join("torn")).expect("read"), torn);
+}
+
+#[test]
+fn stderr_logging_installs_once() {
+    assert_fails(zt_enable_stderr_logging(0), ZtStatus::InvalidArgument, "zt_log_level");
+    assert_fails(zt_enable_stderr_logging(6), ZtStatus::InvalidArgument, "zt_log_level");
+    // ERROR only, so failures that other tests provoke on purpose stay quiet.
+    let status = zt_enable_stderr_logging(ZtLogLevel::Error as i32);
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
+    let status = zt_enable_stderr_logging(ZtLogLevel::Trace as i32);
+    assert_eq!(status, ZtStatus::Ok, "{}", last_error());
 }

@@ -16,7 +16,16 @@ cargo build --release -p ziptensors-capi
 The header documents every function. In short: `zt_open` opens a container with `zt_open_options`
 (set `max_total_decoded` for untrusted input), `zt_member_open` and `zt_read_at` read, `zt_encode_file`
 and `zt_pack_new` write, every call returns a `zt_status` and `zt_last_error` describes the last failure on the
-calling thread. `ZT_ABI_VERSION` and `zt_abi_version` identify the ABI.
+calling thread. `zt_member_info` and `zt_member_verify` describe and check a member, `zt_restore_all`
+restores a whole container, `zt_edit` adds, removes and replaces members (rewrite, append or in place)
+and `zt_recover` repairs a torn append. `zt_enable_stderr_logging` turns on log output.
+`ZT_ABI_VERSION` and `zt_abi_version` identify the ABI.
+
+Note: in every C options struct `max_total_decoded = 0` means no budget, while the Rust, Python and
+command line interfaces take 0 literally.
+
+Not in the C ABI, by design: mounting, decoding a member into a callback, and the per-file tree
+commands. Use the command line tool or the Rust or Python API for those.
 
 ## License
 

@@ -1,12 +1,14 @@
 //! File: profile/tests.rs
-//! Purpose: tests of `scan` and `normalize` over generated files of every format.
+//! Purpose: tests of `scan`, `normalize` and `classify_weight` over generated files of every
+//! format.
 //!
 //! Main responsibilities: each parser finds what its builder put in; malformed, truncated, flipped
 //! and hostile input gives an opaque or in-bounds plan and never an `Err` or a panic; only a failed
 //! read is an `Err`.
 //!
 //! Implementation notes: the builders are in `tests/common/fixtures.rs`. No test reads a real
-//! model, and the single temporary file goes under the system temp directory.
+//! model, and the single temporary file goes under the system temp directory. Legacy torch
+//! prefixes are written out as bytes here; nothing depends on torch.
 
 #[path = "../../tests/common/fixtures.rs"]
 mod fixtures;
@@ -20,7 +22,7 @@ use fixtures::{
     PtZipOptions, Rng, TensorSpec,
 };
 
-use super::{MIN_RANGE_BYTES, normalize, scan};
+use super::{MIN_RANGE_BYTES, WeightKind, classify_weight, legacy_torch, normalize, scan};
 use crate::error::Error;
 use crate::io::{FileSource, RandomAccess};
 use crate::types::{Dtype, Profile, RangePlan};
@@ -961,4 +963,109 @@ fn only_failed_reads_are_errors() {
     }
     let empty = Failing { bytes: Vec::new(), good: 0 };
     assert_eq!(scan(&empty).expect("nothing to read").profile, Profile::Opaque);
+}
+
+fn classify_bytes(bytes: &[u8]) -> Option<WeightKind> {
+    classify_weight(&Memory(bytes.to_vec())).expect("unrecognized content is not an error")
+}
+
+/// The first pickle of a legacy `torch.save` in pickle `protocol` 2 to 5: torch's
+/// `MAGIC_NUMBER`, as `CPython`'s `pickle.dumps(0x1950A86A20F9469CFC6C, protocol)` writes it.
+fn legacy_magic(protocol: u8) -> Vec<u8> {
+    let mut bytes = vec![0x80, protocol];
+    if protocol >= 4 {
+        bytes.push(0x95);
+        bytes.extend_from_slice(&13_u64.to_le_bytes());
+    }
+    bytes.extend_from_slice(&[
+        0x8A, 0x0A, 0x6C, 0xFC, 0x9C, 0x46, 0xF9, 0x20, 0x6A, 0xA8, 0x50, 0x19, 0x2E,
+    ]);
+    bytes
+}
+
+/// A legacy save's start: the magic pickle, then `PROTOCOL_VERSION` 1001 and arbitrary bytes.
+fn legacy_file(protocol: u8) -> Vec<u8> {
+    let mut bytes = legacy_magic(protocol);
+    bytes.extend_from_slice(&[0x80, protocol.min(3), 0x4D, 0xE9, 0x03, 0x2E]);
+    bytes.extend_from_slice(&Rng::new(90 + u64::from(protocol)).bytes(4096));
+    bytes
+}
+
+#[test]
+fn every_parsed_format_is_a_weight_file() {
+    let cases = [
+        (small_safetensors().bytes, Profile::Safetensors),
+        (small_gguf().bytes, Profile::Gguf),
+        (small_onnx().bytes, Profile::Onnx),
+        (small_pt_zip().bytes, Profile::PtZip),
+        (deflated_pt_zip().bytes, Profile::PtZip),
+    ];
+    for (bytes, profile) in cases {
+        assert_eq!(classify_bytes(&bytes), Some(WeightKind::Parsed(profile)));
+    }
+}
+
+#[test]
+fn legacy_torch_saves_are_weight_files_in_protocols_two_to_five() {
+    for protocol in 2..=5 {
+        assert_eq!(classify_bytes(&legacy_file(protocol)), Some(WeightKind::LegacyTorch));
+        assert_eq!(classify_bytes(&legacy_magic(protocol)), Some(WeightKind::LegacyTorch));
+    }
+}
+
+#[test]
+fn a_prefix_one_byte_off_is_not_a_weight_file() {
+    for protocol in 2..=5 {
+        let magic = legacy_magic(protocol);
+        for index in 0..magic.len() {
+            // 0x10 rather than 0x01: flipping the low bit of the protocol byte would only turn
+            // one accepted protocol into another.
+            let mut near = magic.clone();
+            near[index] ^= 0x10;
+            assert_eq!(classify_bytes(&near), None, "protocol {protocol}, byte {index}");
+        }
+        assert_eq!(classify_bytes(&magic[..magic.len() - 1]), None, "protocol {protocol}");
+    }
+    for protocol in [0, 1, 6] {
+        let mut other = legacy_magic(5);
+        other[1] = protocol;
+        assert_eq!(classify_bytes(&other), None, "protocol {protocol}");
+    }
+    let mut long_frame = legacy_magic(4);
+    long_frame[3] = 14;
+    long_frame.push(0x2E);
+    assert_eq!(classify_bytes(&long_frame), None);
+}
+
+#[test]
+fn the_legacy_check_reads_only_the_prefix() {
+    let source = Vast::new(VAST, legacy_magic(5), Vec::new());
+    assert!(legacy_torch::matches(&source).expect("the prefix is readable"));
+    assert!(source.largest.load(Ordering::Relaxed) <= 32);
+    assert!(source.served.load(Ordering::Relaxed) <= 32);
+}
+
+#[test]
+fn other_content_is_not_a_weight_file() {
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+    png.extend_from_slice(&Rng::new(95).bytes(4096));
+    assert_eq!(classify_bytes(&png), None);
+    assert_eq!(classify_bytes(&[]), None);
+    assert_eq!(classify_bytes(b"{\"weight_map\": {}}"), None);
+    let no_pickle = PtZipOptions { flaw: PtZipFlaw::NoPickle, ..PtZipOptions::default() };
+    assert_eq!(classify_bytes(&small_pt_zip_with(&no_pickle)), None);
+    let fixture = small_safetensors();
+    let header_end = usize::try_from(fixture.tensors[0].offset).expect("fits");
+    for cut in [0, 8, 9, header_end / 2, header_end - 1] {
+        assert_eq!(classify_bytes(&fixture.bytes[..cut]), None, "cut at {cut}");
+    }
+}
+
+#[test]
+fn a_failed_read_while_classifying_is_an_error() {
+    for good in [0, 9] {
+        let source = Failing { bytes: legacy_file(4), good };
+        let error = classify_weight(&source).expect_err("the read failed");
+        assert!(matches!(error, Error::Io { op: "read_exact_at", .. }), "{error:?}");
+    }
 }

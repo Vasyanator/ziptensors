@@ -15,7 +15,7 @@ const MIB: usize = 1 << 20;
 
 #[test]
 fn usage_errors_exit_with_2() {
-    let cases: [&[&str]; 9] = [
+    let cases: [&[&str]; 18] = [
         &[],
         &["frobnicate"],
         &["encode", "only-input"],
@@ -26,6 +26,16 @@ fn usage_errors_exit_with_2() {
         // Only `max` stores delta blobs; the check runs before any file is looked at.
         &["pack", "out", "in", "--delta-base", "in", "--mode", "fast"],
         &["pack", "out", "in", "--mode", "balanced", "--delta-base", "in"],
+        &["edit", "c.ziptensors", "--add", "x", "--delta-base", "m", "--mode", "fast"],
+        // An edit needs an operation; two strategies, or repack with another strategy, conflict.
+        &["edit", "c.ziptensors"],
+        &["edit", "c.ziptensors", "--add", "x", "-F", "-R"],
+        &["edit", "c.ziptensors", "--add", "x", "-F", "-C"],
+        &["edit", "c.ziptensors", "--add", "x", "-R", "-C"],
+        &["edit", "c.ziptensors", "--add-as", "only-name"],
+        &["compact", "c.ziptensors", "-R", "-C"],
+        &["compact", "c.ziptensors", "-F"],
+        &["recover"],
     ];
     for args in cases {
         let output = ziptensors(args);
@@ -41,7 +51,11 @@ fn usage_errors_exit_with_2() {
 fn help_exits_with_0_on_stdout() {
     let output = ziptensors(["--help"]);
     assert_eq!(output.code, 0, "{output:?}");
-    for command in ["encode", "pack", "restore", "extract", "merge", "inspect", "verify"] {
+    let commands = [
+        "encode", "pack", "edit", "compact", "recover", "restore", "extract", "merge", "inspect", "verify",
+        "compress", "decompress",
+    ];
+    for command in commands {
         assert!(output.stdout.contains(command), "{output:?}");
     }
 }
@@ -167,8 +181,8 @@ fn pack_stops_on_failures_with_no_output() {
     fs::create_dir_all(scratch.path("out")).expect("create output directory");
     let absent = scratch.path("absent");
     let cases = [
-        ("cannot read input", vec![good.clone(), absent]),
-        ("two inputs", vec![scratch.path("in/one"), scratch.path("in/two")]),
+        ("cannot read the inputs", vec![good.clone(), absent]),
+        ("is used twice", vec![scratch.path("in/one"), scratch.path("in/two")]),
         ("nothing to pack", vec![scratch.path("only")]),
     ];
     for (message, inputs) in cases {
@@ -404,16 +418,37 @@ fn merge_copies_members_of_several_containers() {
     assert!(fs::read(dir.join("first.bin")).expect("read first") == first);
     assert!(fs::read(dir.join("second.bin")).expect("read second") == second);
 
-    // The same member twice is the core's refusal, and leaves nothing behind.
+    // A member name in two inputs is refused before the output is started: no member is copied,
+    // and the error names the member, not damage.
     let twice_path = scratch.path("twice.ziptensors");
     let twice = ziptensors([
         "merge".as_ref(),
         twice_path.as_os_str(),
         first_container.as_os_str(),
+        second_container.as_os_str(),
         first_container.as_os_str(),
     ]);
     assert_eq!(twice.code, 1, "{twice:?}");
     assert!(!twice_path.exists());
+    assert!(twice.stderr.contains("code_value=26"), "{twice:?}");
+    assert!(twice.stderr.contains(r#"member name "first.bin" is used twice"#), "{twice:?}");
+    assert!(twice.stderr.contains("hint: two inputs would be stored under one member name"), "{twice:?}");
+    assert!(!twice.stderr.contains("copying member"), "{twice:?}");
+    assert!(!twice.stderr.contains("damaged"), "{twice:?}");
+}
+
+#[test]
+fn pack_refuses_two_inputs_with_one_member_name() {
+    let scratch = Scratch::new();
+    let first = scratch.write("a/w.bin", &bytes(14, 4096));
+    let second = scratch.write("b/w.bin", &bytes(15, 4096));
+    let output = scratch.path("out.ziptensors");
+    let packed = ziptensors(["pack".as_ref(), output.as_os_str(), first.as_os_str(), second.as_os_str()]);
+    assert_eq!(packed.code, 1, "{packed:?}");
+    assert!(!output.exists());
+    assert!(packed.stderr.contains("code_value=26"), "{packed:?}");
+    assert!(packed.stderr.contains(r#"member name "w.bin" is used twice"#), "{packed:?}");
+    assert!(packed.stderr.contains("hint: two inputs would be stored under one member name"), "{packed:?}");
 }
 
 #[test]
@@ -608,4 +643,597 @@ fn mount_refuses_a_mount_point_in_use_once_and_bounds_its_threads() {
     }
     let output = ziptensors(["mount".as_ref(), container.as_os_str(), "C:".as_ref(), "--winfsp-threads".as_ref(), "65".as_ref()]);
     assert_eq!(output.code, 2, "{output:?}");
+}
+
+/// Packs `files` (name, content) under `tree/` of `scratch` into `pack.ziptensors` and returns its path.
+fn pack_of(scratch: &Scratch, files: &[(&str, &[u8])]) -> std::path::PathBuf {
+    for (name, content) in files {
+        scratch.write(&format!("tree/{name}"), content);
+    }
+    let container = scratch.path("pack.ziptensors");
+    let packed = ziptensors([
+        "pack".as_ref(),
+        container.as_os_str(),
+        scratch.path("tree").as_os_str(),
+        "--threads".as_ref(),
+        "2".as_ref(),
+    ]);
+    assert_eq!(packed.code, 0, "{packed:?}");
+    container
+}
+
+/// The member names of `container`, in file order, through `inspect --json`.
+fn member_names(container: &Path) -> Vec<String> {
+    let output = ziptensors(["inspect".as_ref(), container.as_os_str(), "--json".as_ref()]);
+    assert_eq!(output.code, 0, "{output:?}");
+    let document = parse_json(&output.stdout);
+    let members = document.get("members").array();
+    members.iter().map(|member| member.get("name").string().to_owned()).collect()
+}
+
+/// Restores every member of `container` under `dir` and returns the content of `name` there.
+fn restored(container: &Path, dir: &Path, name: &str) -> Vec<u8> {
+    let output = ziptensors(["restore".as_ref(), container.as_os_str(), "--all".as_ref(), dir.as_os_str()]);
+    assert_eq!(output.code, 0, "{output:?}");
+    fs::read(dir.join(name)).expect("read restored member")
+}
+
+#[test]
+fn edit_adds_removes_and_replaces_in_every_strategy() {
+    let a = bytes(30, 64 * 1024);
+    let b = safetensors(31, 4096);
+    let c = bytes(32, 32 * 1024);
+    let replacement = bytes(33, 48 * 1024);
+    let added = safetensors(34, 2048);
+    for strategy in [None, Some("-F"), Some("-R")] {
+        let scratch = Scratch::new();
+        let container = pack_of(&scratch, &[("a.bin", &a), ("b.safetensors", &b), ("c.bin", &c)]);
+        let new_file = scratch.write("new.safetensors", &added);
+        let replacing = scratch.write("replacement.bin", &replacement);
+        let mut args = vec![
+            "edit".into(),
+            container.clone().into_os_string(),
+            "--add".into(),
+            new_file.into_os_string(),
+            "--remove".into(),
+            "c.bin".into(),
+            "--replace".into(),
+            "a.bin".into(),
+            replacing.into_os_string(),
+            "--threads".into(),
+            "2".into(),
+        ];
+        args.extend(strategy.map(std::ffi::OsString::from));
+        let output = ziptensors(args);
+        assert_eq!(output.code, 0, "{strategy:?}: {output:?}");
+        assert_eq!(summary_line(&output.stdout, "members"), "3", "{output:?}");
+        assert!(output.stdout.contains("1 kept, 1 added, 1 replaced, 1 removed"), "{output:?}");
+        assert_eq!(summary_line(&output.stdout, "generation"), "2", "{output:?}");
+        let risky_warning = output.stderr.contains("warning: -R rewrites");
+        assert_eq!(risky_warning, strategy == Some("-R"), "{output:?}");
+        // The kept member keeps its place, the replacement takes its member's, the new file goes last.
+        assert_eq!(member_names(&container), ["a.bin", "b.safetensors", "new.safetensors"]);
+        let verified = ziptensors(["verify".as_ref(), container.as_os_str()]);
+        assert_eq!(verified.code, 0, "{verified:?}");
+        let dir = scratch.path("restored");
+        assert!(restored(&container, &dir, "a.bin") == replacement);
+        assert!(fs::read(dir.join("b.safetensors")).expect("kept") == b);
+        assert!(fs::read(dir.join("new.safetensors")).expect("added") == added);
+    }
+}
+
+#[test]
+fn edit_keeps_the_command_line_order_of_added_files_and_names_them() {
+    let scratch = Scratch::new();
+    let container = pack_of(&scratch, &[("a.bin", &bytes(35, 4096))]);
+    let first = scratch.write("first.bin", &bytes(36, 4096));
+    let second = scratch.write("second.bin", &bytes(37, 4096));
+    let third = scratch.write("third.bin", &bytes(38, 4096));
+    let output = ziptensors([
+        "edit".as_ref(),
+        container.as_os_str(),
+        "--add".as_ref(),
+        first.as_os_str(),
+        "--add-as".as_ref(),
+        "dir/named.bin".as_ref(),
+        second.as_os_str(),
+        "--add".as_ref(),
+        third.as_os_str(),
+    ]);
+    assert_eq!(output.code, 0, "{output:?}");
+    assert_eq!(member_names(&container), ["a.bin", "first.bin", "dir/named.bin", "third.bin"]);
+}
+
+#[test]
+fn edit_refusals_change_nothing_and_say_so() {
+    let scratch = Scratch::new();
+    let content = bytes(39, 4096);
+    let container = pack_of(&scratch, &[("a.bin", &content)]);
+    let before = fs::read(&container).expect("container");
+    let same_name = scratch.write("other/a.bin", &bytes(40, 4096));
+    let output = ziptensors(["edit".as_ref(), container.as_os_str(), "--add".as_ref(), same_name.as_os_str()]);
+    assert_eq!(output.code, 1, "{output:?}");
+    assert!(output.stderr.contains("edit refused"), "{output:?}");
+    assert!(output.stderr.contains("code_value=22"), "{output:?}");
+    assert!(output.stderr.contains("hint: nothing was written"), "{output:?}");
+    assert_eq!(fs::read(&container).expect("container"), before);
+
+    let missing = ziptensors(["edit".as_ref(), container.as_os_str(), "--remove".as_ref(), "nope".as_ref()]);
+    assert_eq!(missing.code, 1, "{missing:?}");
+    assert!(missing.stderr.contains("member not found"), "{missing:?}");
+    assert_eq!(fs::read(&container).expect("container"), before);
+}
+
+#[test]
+fn compact_drops_what_appends_left_behind() {
+    let scratch = Scratch::new();
+    let content = bytes(41, 256 * 1024);
+    let container = pack_of(&scratch, &[("a.bin", &content), ("b.bin", &bytes(42, 128 * 1024))]);
+    let removed = ziptensors(["edit".as_ref(), container.as_os_str(), "--remove".as_ref(), "b.bin".as_ref(), "-F".as_ref()]);
+    assert_eq!(removed.code, 0, "{removed:?}");
+    let len = |path: &Path| fs::metadata(path).expect("container").len();
+    let appended = len(&container);
+    for flags in [&[][..], &["-C"][..], &["-R"][..]] {
+        let mut args = vec!["compact".into(), container.clone().into_os_string()];
+        args.extend(flags.iter().map(std::ffi::OsString::from));
+        let output = ziptensors(args);
+        assert_eq!(output.code, 0, "{flags:?}: {output:?}");
+        assert!(output.stdout.contains("0 added, 0 replaced, 0 removed"), "{output:?}");
+        assert!(len(&container) < appended, "{flags:?}");
+        assert_eq!(member_names(&container), ["a.bin"]);
+    }
+    assert!(restored(&container, &scratch.path("restored"), "a.bin") == content);
+}
+
+#[test]
+fn extract_to_standard_output_writes_the_member_alone() {
+    let scratch = Scratch::new();
+    let wanted = bytes(43, MIB + 12_345);
+    let container = pack_of(&scratch, &[("keep/wanted.bin", &wanted), ("other.bin", &bytes(44, 4096))]);
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_ziptensors"))
+        .args(["extract".as_ref(), container.as_os_str(), "keep/wanted.bin".as_ref(), "-".as_ref()])
+        .output()
+        .expect("run the binary");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    assert!(output.stdout == wanted, "{} bytes on stdout", output.stdout.len());
+    assert!(stderr.contains("restored keep/wanted.bin to -"), "{stderr}");
+    assert!(!scratch.path("-").exists());
+}
+
+#[test]
+fn inspect_lists_tensors_on_request() {
+    let scratch = Scratch::new();
+    let container = pack_of(&scratch, &[("a.bin", &bytes(45, 4096)), ("model.safetensors", &safetensors(46, 1000))]);
+    let output = ziptensors([
+        "inspect".as_ref(),
+        container.as_os_str(),
+        "--json".as_ref(),
+        "--tensors".as_ref(),
+        "--max-total-decoded".as_ref(),
+        "1000000".as_ref(),
+    ]);
+    assert_eq!(output.code, 0, "{output:?}");
+    let document = parse_json(&output.stdout);
+    assert_eq!(document.get("schema_version").number(), 1);
+    let members = document.get("members").array();
+    assert!(members[0].get("tensors").array().is_empty());
+    let tensors = members[1].get("tensors").array();
+    assert_eq!(tensors.len(), 1);
+    assert_eq!(tensors[0].get("name").string(), "t");
+    assert_eq!(tensors[0].get("dtype").string(), "F32");
+    assert_eq!(tensors[0].get("len").number(), 4000);
+    assert!(tensors[0].get("offset").number() > 0);
+    let shape: Vec<_> = tensors[0].get("shape").array().iter().map(common::Value::number).collect();
+    assert_eq!(shape, [1000]);
+
+    // Without --tensors the key is absent; the budget refuses before anything is read.
+    let plain = ziptensors(["inspect".as_ref(), container.as_os_str(), "--json".as_ref()]);
+    assert!(!plain.stdout.contains("\"tensors\""), "{plain:?}");
+    let text = ziptensors(["inspect".as_ref(), container.as_os_str(), "--tensors".as_ref()]);
+    assert_eq!(text.code, 0, "{text:?}");
+    assert!(text.stdout.contains("F32") && text.stdout.contains("[1000]"), "{text:?}");
+    let refused = ziptensors(["inspect".as_ref(), container.as_os_str(), "--max-total-decoded".as_ref(), "10".as_ref()]);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stderr.contains("more than this reader accepts"), "{refused:?}");
+}
+
+#[test]
+fn verify_and_merge_take_a_budget() {
+    let scratch = Scratch::new();
+    let container = pack_of(&scratch, &[("a.bin", &[1; 1000])]);
+    let verify = ziptensors(["verify".as_ref(), container.as_os_str(), "--max-total-decoded".as_ref(), "999".as_ref()]);
+    assert_eq!(verify.code, 1, "{verify:?}");
+    let merged = scratch.path("merged.ziptensors");
+    let merge = ziptensors([
+        "merge".as_ref(),
+        merged.as_os_str(),
+        container.as_os_str(),
+        "--max-total-decoded".as_ref(),
+        "999".as_ref(),
+    ]);
+    assert_eq!(merge.code, 1, "{merge:?}");
+    assert!(!merged.exists());
+}
+
+/// A container edited once with `-F`, whose last `cut` bytes are then lost: the newest footer is
+/// torn, and the first generation is intact before `first_len`. Returns `(container, first_len)`.
+fn torn_append(scratch: &Scratch, cut: u64) -> (std::path::PathBuf, u64) {
+    let container = pack_of(scratch, &[("a.bin", &bytes(47, 64 * 1024))]);
+    let first_len = fs::metadata(&container).expect("container").len();
+    let added = scratch.write("added.bin", &bytes(48, 32 * 1024));
+    let output = ziptensors(["edit".as_ref(), container.as_os_str(), "--add".as_ref(), added.as_os_str(), "-F".as_ref()]);
+    assert_eq!(output.code, 0, "{output:?}");
+    let file = fs::OpenOptions::new().write(true).open(&container).expect("open for cutting");
+    let len = file.metadata().expect("length").len();
+    file.set_len(len - cut).expect("tear the tail");
+    (container, first_len)
+}
+
+#[test]
+fn recover_shortens_a_torn_append_to_the_older_generation() {
+    let scratch = Scratch::new();
+    let (container, first_len) = torn_append(&scratch, 10);
+    let torn_len = fs::metadata(&container).expect("container").len();
+    let broken = ziptensors(["verify".as_ref(), container.as_os_str()]);
+    assert_eq!(broken.code, 1, "{broken:?}");
+    // The torn footer is a malformed index, whose hint points to the recovery dry run.
+    assert!(broken.stderr.contains("code_value=6"), "{broken:?}");
+    // The hint names the container the user gave, not a placeholder.
+    let hint = broken.stderr.lines().find(|line| line.starts_with("hint: ")).expect("a hint line");
+    assert!(hint.contains("`ziptensors recover --dry-run "), "{hint}");
+    assert!(!hint.contains("<CONTAINER>"), "{hint}");
+    let name = container.file_name().and_then(|name| name.to_str()).expect("a UTF-8 file name");
+    // Unquoted, or quoted for the shell: single quotes on Unix, double quotes on Windows.
+    let ends = [format!("{name}`"), format!("{name}'`"), format!("{name}\"`")];
+    assert!(ends.iter().any(|end| hint.contains(end.as_str())), "{hint}");
+
+    let dry = ziptensors(["recover".as_ref(), container.as_os_str(), "--dry-run".as_ref()]);
+    assert_eq!(dry.code, 0, "{dry:?}");
+    assert!(dry.stdout.contains("would recover"), "{dry:?}");
+    assert_eq!(summary_line(&dry.stdout, "valid bytes"), first_len.to_string());
+    assert_eq!(summary_line(&dry.stdout, "generation"), "1");
+    assert!(dry.stderr.contains("warning: recovered generation 1"), "{dry:?}");
+    assert!(dry.stderr.contains("would be discarded"), "{dry:?}");
+    // A torn footer is not a candidate: nothing was passed over, and the warning does not say so.
+    assert_eq!(summary_line(&dry.stdout, "passed over"), "0");
+    assert!(!dry.stderr.contains("passed over"), "{dry:?}");
+    assert_eq!(fs::metadata(&container).expect("container").len(), torn_len);
+
+    let done = ziptensors(["recover".as_ref(), container.as_os_str(), "--max-candidates".as_ref(), "8".as_ref()]);
+    assert_eq!(done.code, 0, "{done:?}");
+    assert!(done.stdout.starts_with("recovered:"), "{done:?}");
+    assert!(done.stderr.contains(&format!("({torn_len} -> {first_len} bytes) were discarded")), "{done:?}");
+    assert_eq!(fs::metadata(&container).expect("container").len(), first_len);
+    assert_eq!(member_names(&container), ["a.bin"]);
+
+    let again = ziptensors(["recover".as_ref(), container.as_os_str()]);
+    assert_eq!(again.code, 0, "{again:?}");
+    assert!(again.stdout.contains("intact, nothing to do"), "{again:?}");
+    assert!(!again.stderr.contains("warning:"), "{again:?}");
+}
+
+#[test]
+fn recover_says_when_nothing_is_left_to_recover() {
+    let scratch = Scratch::new();
+    let container = pack_of(&scratch, &[("a.bin", &bytes(49, 4096))]);
+    let mut file = fs::read(&container).expect("container");
+    // The header alone, then garbage: no footer anywhere.
+    file.truncate(64);
+    file.extend_from_slice(&bytes(50, 4096));
+    fs::write(&container, &file).expect("write");
+    let output = ziptensors(["recover".as_ref(), container.as_os_str()]);
+    assert_eq!(output.code, 1, "{output:?}");
+    assert!(output.stderr.contains("code_value=24"), "{output:?}");
+    assert!(output.stderr.contains("hint: no valid container was found"), "{output:?}");
+    assert_eq!(fs::read(&container).expect("container"), file);
+}
+
+#[cfg(unix)]
+#[test]
+fn recover_of_a_file_it_cannot_write_points_to_the_dry_run() {
+    use std::os::unix::fs::PermissionsExt;
+    let scratch = Scratch::new();
+    let (container, _) = torn_append(&scratch, 10);
+    fs::set_permissions(&container, fs::Permissions::from_mode(0o444)).expect("read only");
+    let output = ziptensors(["recover".as_ref(), container.as_os_str()]);
+    if output.code == 0 {
+        // A privileged user opens the file anyway: nothing to observe here.
+        eprintln!("skipping: the file opened for writing despite its mode");
+        return;
+    }
+    assert_eq!(output.code, 1, "{output:?}");
+    assert!(output.stderr.contains("hint: the file cannot be opened for writing"), "{output:?}");
+    assert!(output.stderr.contains("--dry-run"), "{output:?}");
+    let dry = ziptensors(["recover".as_ref(), container.as_os_str(), "--dry-run".as_ref()]);
+    assert_eq!(dry.code, 0, "{dry:?}");
+}
+
+#[test]
+fn compress_and_decompress_round_trip_a_tree() {
+    let scratch = Scratch::new();
+    let model = safetensors(51, 64 * 1024);
+    let nested = safetensors(52, 16 * 1024);
+    let config = b"{\"not\": \"weights\"}".to_vec();
+    scratch.write("tree/model.safetensors", &model);
+    scratch.write("tree/sub/nested.safetensors", &nested);
+    scratch.write("tree/config.json", &config);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(scratch.path("tree/model.safetensors"), scratch.path("tree/link.safetensors"))
+        .expect("link");
+    let tree = scratch.path("tree");
+
+    let no_r = ziptensors(["compress".as_ref(), tree.as_os_str()]);
+    assert_eq!(no_r.code, 2, "{no_r:?}");
+    assert!(no_r.stderr.contains("pass -r"), "{no_r:?}");
+
+    let dry = ziptensors(["compress".as_ref(), "-r".as_ref(), tree.as_os_str(), "--dry-run".as_ref()]);
+    assert_eq!(dry.code, 0, "{dry:?}");
+    assert!(dry.stdout.contains("would: "), "{dry:?}");
+    assert!(dry.stdout.contains("dry run, nothing written"), "{dry:?}");
+    assert!(!scratch.path("tree/model.ziptensors").exists());
+
+    let compressed = ziptensors(["compress".as_ref(), "-r".as_ref(), tree.as_os_str(), "--threads".as_ref(), "2".as_ref()]);
+    assert_eq!(compressed.code, 0, "{compressed:?}");
+    assert!(compressed.stdout.contains("compressed: "), "{compressed:?}");
+    assert!(compressed.stdout.contains("2 compressed"), "{compressed:?}");
+    assert!(compressed.stdout.contains("not a weight file: "), "{compressed:?}");
+    assert!(!scratch.path("tree/model.safetensors").exists());
+    assert!(scratch.path("tree/model.ziptensors").exists());
+    assert!(scratch.path("tree/sub/nested.ziptensors").exists());
+    assert!(fs::read(scratch.path("tree/config.json")).expect("untouched") == config);
+    if cfg!(unix) {
+        assert!(compressed.stderr.contains("warning: 1 symbolic links were skipped"), "{compressed:?}");
+        assert!(compressed.stderr.contains("--follow-symlinks"), "{compressed:?}");
+        assert!(compressed.stderr.contains("Hugging Face"), "{compressed:?}");
+    }
+
+    // A single container needs no -r.
+    let single = scratch.path("tree/sub/nested.ziptensors");
+    let one = ziptensors(["decompress".as_ref(), single.as_os_str(), "-k".as_ref()]);
+    assert_eq!(one.code, 0, "{one:?}");
+    assert!(fs::read(scratch.path("tree/sub/nested.safetensors")).expect("restored") == nested);
+    assert!(single.exists());
+
+    let decompressed = ziptensors(["decompress".as_ref(), "-r".as_ref(), tree.as_os_str()]);
+    assert_eq!(decompressed.code, 0, "{decompressed:?}");
+    assert!(decompressed.stdout.contains("restored: "), "{decompressed:?}");
+    // Both arrows of a line point from the container to the restored file.
+    let restored_line = decompressed.stdout.lines().find(|line| line.starts_with("restored: ")).expect("a restored line");
+    assert!(restored_line.contains("model.ziptensors -> "), "{restored_line}");
+    assert!(restored_line.contains(&format!(" -> {} bytes)", model.len())), "{restored_line}");
+    // The restored model and the nested pair (restored above with -k) are the bytes brought back.
+    let bytes_line = decompressed.stdout.lines().find(|line| line.starts_with("bytes: ")).expect("a bytes line");
+    assert!(
+        bytes_line.ends_with(&format!(" in containers -> {} uncompressed", model.len() + nested.len())),
+        "{bytes_line}"
+    );
+    assert!(fs::read(scratch.path("tree/model.safetensors")).expect("restored") == model);
+    assert!(fs::read(scratch.path("tree/sub/nested.safetensors")).expect("restored") == nested);
+    assert!(!scratch.path("tree/model.ziptensors").exists());
+    assert!(!single.exists());
+}
+
+#[test]
+fn decompress_fails_a_container_whose_restore_path_holds_other_bytes() {
+    let scratch = Scratch::new();
+    let model = safetensors(53, 4096);
+    let file = scratch.write("dir/model.safetensors", &model);
+    let compressed = ziptensors(["compress".as_ref(), file.as_os_str(), "-k".as_ref()]);
+    assert_eq!(compressed.code, 0, "{compressed:?}");
+    assert!(scratch.path("dir/model.ziptensors").exists());
+    let other = safetensors(54, 4096);
+    fs::write(&file, &other).expect("overwrite");
+    let container = scratch.path("dir/model.ziptensors");
+    let failed = ziptensors(["decompress".as_ref(), container.as_os_str()]);
+    assert_eq!(failed.code, 1, "{failed:?}");
+    assert!(failed.stdout.contains("FAILED: "), "{failed:?}");
+    assert!(failed.stderr.contains("1 file(s) failed to decompress"), "{failed:?}");
+    assert!(fs::read(&file).expect("kept") == other);
+    let forced = ziptensors(["decompress".as_ref(), container.as_os_str(), "--force".as_ref()]);
+    assert_eq!(forced.code, 0, "{forced:?}");
+    assert!(fs::read(&file).expect("restored") == model);
+}
+
+#[cfg(any(target_os = "linux", windows))]
+#[test]
+fn mount_overlay_flags_and_sources_are_checked_before_anything_runs() {
+    let scratch = Scratch::new();
+    let file = scratch.write("plain.bin", b"not a directory");
+    let dir = scratch.path("tree");
+    fs::create_dir(&dir).expect("create tree");
+    let point = scratch.path("mnt");
+    let cases: [(&[&std::ffi::OsStr], &str); 5] = [
+        (&[file.as_os_str(), point.as_os_str(), "--overlay".as_ref()], "is not a directory: --overlay"),
+        (&[dir.as_os_str(), point.as_os_str()], "pass --overlay"),
+        (&[dir.as_os_str(), point.as_os_str(), "--max-open-files".as_ref(), "2".as_ref()], "--overlay"),
+        (&[dir.as_os_str(), point.as_os_str(), "--max-open-containers".as_ref(), "2".as_ref()], "--overlay"),
+        (&[dir.as_os_str(), point.as_os_str(), "--overlay".as_ref(), "--max-open-containers".as_ref(), "0".as_ref()], "0"),
+    ];
+    for (args, says) in cases {
+        let output = ziptensors(std::iter::once("mount".as_ref()).chain(args.iter().copied()));
+        assert_eq!(output.code, 2, "{args:?}: {output:?}");
+        assert!(output.stderr.contains(says), "{args:?}: {output:?}");
+        assert_eq!(output.stdout, "", "{args:?}: {output:?}");
+    }
+}
+
+/// A running `ziptensors mount` child on Linux. Drop unmounts lazily and kills the child, so a failed
+/// assertion leaves no mount behind; [`MountChild::finish`] ends it the normal way.
+#[cfg(target_os = "linux")]
+struct MountChild {
+    child: std::process::Child,
+    mountpoint: std::path::PathBuf,
+    stdout: std::sync::mpsc::Receiver<String>,
+    stderr: Option<std::thread::JoinHandle<String>>,
+}
+
+#[cfg(target_os = "linux")]
+impl MountChild {
+    /// How long a step of the child may take before the test fails.
+    const PATIENCE: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Starts the binary with `args`, mounting on `mountpoint`, and waits for its `mounted` line.
+    fn start(args: &[&std::ffi::OsStr], mountpoint: &Path) -> Self {
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::{Command, Stdio};
+
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ziptensors"))
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("start the mount");
+        let out = child.stdout.take().expect("stdout is piped");
+        let (send, stdout) = std::sync::mpsc::channel();
+        // Lines go through a channel so that a child that never mounts fails the test, not hangs it.
+        std::thread::spawn(move || {
+            for line in BufReader::new(out).lines() {
+                let Ok(line) = line else { return };
+                if send.send(line).is_err() {
+                    return;
+                }
+            }
+        });
+        let mut err = child.stderr.take().expect("stderr is piped");
+        // Drained all the time: the INFO log of a mount would fill the pipe and stop the child.
+        let stderr = Some(std::thread::spawn(move || {
+            let mut text = String::new();
+            if let Err(error) = err.read_to_string(&mut text) {
+                text = format!("{text}\n(stderr unreadable: {error})");
+            }
+            text
+        }));
+        let mut mounted = Self { child, mountpoint: mountpoint.to_path_buf(), stdout, stderr };
+        let line = mounted.stdout.recv_timeout(Self::PATIENCE);
+        let Ok(line) = line else {
+            let log = mounted.stop_log();
+            panic!("no mounted line ({line:?}); stderr:\n{log}");
+        };
+        assert!(line.starts_with("mounted "), "{line}");
+        mounted
+    }
+
+    /// Unmounts with `fusermount3 -u` as a user would, and returns the exit code and the next stdout
+    /// line of the child.
+    fn finish(mut self) -> (i32, String) {
+        // Retried until PATIENCE: other tests of this binary fork children concurrently, and a fork
+        // briefly duplicates every descriptor of this process, so a file just read under the mount
+        // can still be open in a child that has not reached `exec` yet, and the kernel says EBUSY.
+        let deadline = std::time::Instant::now() + Self::PATIENCE;
+        loop {
+            let status = std::process::Command::new("fusermount3")
+                .arg("-u")
+                .arg(&self.mountpoint)
+                .status()
+                .expect("run fusermount3");
+            if status.success() {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "fusermount3 -u: {status}");
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let deadline = std::time::Instant::now() + Self::PATIENCE;
+        let code = loop {
+            if let Some(status) = self.child.try_wait().expect("poll the mount") {
+                break status.code().expect("the mount exits, it is not killed");
+            }
+            assert!(std::time::Instant::now() < deadline, "the mount did not end: {}", self.stop_log());
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let line = self.stdout.recv_timeout(Self::PATIENCE).unwrap_or_default();
+        (code, line)
+    }
+
+    /// Ends the child at once and returns what it logged.
+    fn stop_log(&mut self) -> String {
+        if let Err(error) = self.child.kill() {
+            eprintln!("cannot kill the mount: {error}");
+        }
+        if let Err(error) = self.child.wait() {
+            eprintln!("cannot wait for the mount: {error}");
+        }
+        let reader = self.stderr.take();
+        reader.map_or_else(String::new, |reader| reader.join().unwrap_or_else(|_| "(stderr reader panicked)".to_owned()))
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for MountChild {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        let unmounted = std::process::Command::new("fusermount3").arg("-u").arg("-z").arg(&self.mountpoint).status();
+        if let Err(error) = unmounted {
+            eprintln!("cannot run fusermount3 -u -z {}: {error}", self.mountpoint.display());
+        }
+        let log = self.stop_log();
+        eprintln!("mount stopped by the test; its log:\n{log}");
+    }
+}
+
+/// Why this machine cannot mount without privileges, or `None` if it can: the skip rule of the
+/// mount crate's FUSE tests.
+#[cfg(target_os = "linux")]
+fn fuse_unavailable() -> Option<String> {
+    if let Err(error) = fs::OpenOptions::new().read(true).write(true).open("/dev/fuse") {
+        return Some(format!("/dev/fuse cannot be opened for reading and writing: {error}"));
+    }
+    let on_path = std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join("fusermount3").is_file()));
+    if on_path { None } else { Some("fusermount3 is not on PATH".to_owned()) }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn mount_overlay_shows_a_compressed_tree_as_its_originals() {
+    if let Some(reason) = fuse_unavailable() {
+        eprintln!("skipped: {reason}");
+        return;
+    }
+    let scratch = Scratch::new();
+    let model = safetensors(61, 64 * 1024);
+    let nested = safetensors(62, 16 * 1024);
+    let config = b"{\"not\": \"weights\"}".to_vec();
+    scratch.write("tree/model.safetensors", &model);
+    scratch.write("tree/sub/nested.safetensors", &nested);
+    scratch.write("tree/config.json", &config);
+    let tree = scratch.path("tree");
+    let compressed = ziptensors(["compress".as_ref(), "-r".as_ref(), tree.as_os_str()]);
+    assert_eq!(compressed.code, 0, "{compressed:?}");
+    assert!(scratch.path("tree/model.ziptensors").exists());
+    assert!(!scratch.path("tree/model.safetensors").exists());
+    let mountpoint = scratch.path("mnt");
+    fs::create_dir(&mountpoint).expect("create mountpoint");
+
+    // One container open at a time, so reading the second closes the first.
+    let mounted = MountChild::start(
+        &[
+            "mount".as_ref(),
+            "--overlay".as_ref(),
+            tree.as_os_str(),
+            mountpoint.as_os_str(),
+            "--max-open-containers".as_ref(),
+            "1".as_ref(),
+            "--cache-size".as_ref(),
+            "33554432".as_ref(),
+            "--threads".as_ref(),
+            "2".as_ref(),
+        ],
+        &mountpoint,
+    );
+    assert_eq!(scratch.list("mnt"), ["config.json", "model.safetensors", "sub"]);
+    assert_eq!(scratch.list("mnt/sub"), ["nested.safetensors"]);
+    assert!(fs::read(mountpoint.join("model.safetensors")).expect("read through the mount") == model);
+    assert!(fs::read(mountpoint.join("sub/nested.safetensors")).expect("read through the mount") == nested);
+    assert!(fs::read(mountpoint.join("model.safetensors")).expect("read again") == model);
+    assert_eq!(fs::read(mountpoint.join("config.json")).expect("read through the mount"), config);
+    let (code, line) = mounted.finish();
+    assert_eq!(code, 0, "{line}");
+    assert!(line.starts_with("unmounted "), "{line}");
+    let mounts = fs::read_to_string("/proc/mounts").expect("read /proc/mounts");
+    let shown = mountpoint.display().to_string();
+    assert!(!mounts.lines().any(|line| line.contains(&shown)), "{mounts}");
 }

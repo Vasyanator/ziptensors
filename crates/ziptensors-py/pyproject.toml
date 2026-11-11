@@ -67,3 +67,5 @@ include = [
 testpaths = ["tests"]
 # No `.pytest_cache` in the tree.
 addopts = "-p no:cacheprovider"
+# Several tests write hundreds of MiB to `tmp_path`; keep only what a failure needs to diagnose.
+tmp_path_retention_policy = "failed"

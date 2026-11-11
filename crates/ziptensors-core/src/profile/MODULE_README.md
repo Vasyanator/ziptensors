@@ -3,7 +3,8 @@
 ## Purpose
 
 Finds tensor data in a source file, so that the writer can pick transforms. The result is a hint: it
-picks codecs and names tensors and is never trusted for restore.
+picks codecs and names tensors and is never trusted for restore. Also owns the single predicate "is
+this a weight file", used to choose which files of a directory tree get compressed.
 
 ## Architecture
 
@@ -11,11 +12,15 @@ picks codecs and names tensors and is never trusted for restore.
 word followed by `{`, then a structural check of the top-level ONNX fields. A parser returns a raw
 `RangePlan`, and the writer passes it through `normalize` before using it.
 
+`classify_weight` runs `scan`; a recognized profile is a weight file. Only for an opaque result it
+then asks `legacy_torch` whether the file starts with a legacy `torch.save` pickle.
+
 ## Files and submodules
 
 | Path | Role |
 |---|---|
-| `mod.rs` | `scan`, dispatch, the internal `Stop` outcome, parser caps shared across formats. |
+| `mod.rs` | `scan`, dispatch, `classify_weight`, the internal `Stop` outcome, parser caps shared across formats. |
+| `legacy_torch.rs` | Byte-prefix check for legacy (pre-1.6, pickle stream) `torch.save` files. Owns the torch constants and their source. |
 | `reader.rs` | `Reader`: bounded cursor over `RandomAccess`. All parsers read through it. |
 | `json.rs` | Pull JSON reader for the safetensors header. No tree is built. |
 | `safetensors.rs`, `gguf.rs`, `onnx.rs`, `pt_zip.rs` | One parser per format. |
@@ -29,6 +34,8 @@ word followed by `{`, then a structural check of the top-level ONNX fields. A pa
 - `normalize(plan, file_len) -> RangePlan`: sorted disjoint ranges, trimmed to block, each at least
   `MIN_RANGE_BYTES`; rows the tensor table can hold.
 - `width_trial(sample) -> u8`: 1, 2, 4 or 8.
+- `classify_weight(src) -> Result<Option<WeightKind>, Error>`: `Parsed(profile)` for any profile but
+  opaque, `LegacyTorch` for a legacy torch pickle, `None` otherwise.
 
 ## Contracts and invariants
 
@@ -57,6 +64,15 @@ word followed by `{`, then a structural check of the top-level ONNX fields. A pa
 - Block geometry (elements and bytes per block) belongs to `chain`, through `Dtype::block_geometry`;
   `gguf.rs` owns only the ggml type numbers.
 - This module knows nothing of the container format.
+- Weight predicate: content only, never size or name. `Some` iff a parser recognized the file (even
+  with no tensors, or with tensor data cut short) or the legacy torch prefix matches; so HF shards in
+  either torch form or as safetensors are weights, and `*.index.json`, configs, images and unknown
+  `.bin` files are not. A false positive costs ratio only, since compression is lossless. False
+  negatives: a legacy save with a custom `pickle_module`, pickle protocol 6 or later, or the older
+  tar-based format; a truncated or corrupt header, which `scan` sees as opaque.
+- The legacy torch check reads at most 32 bytes from offset 0 and never unpickles. It accepts
+  `PROTO 2|3` + the pickle of `MAGIC_NUMBER`, or `PROTO 4|5` + a `FRAME` of exactly that pickle's
+  length + the same pickle. A legacy file has no `Profile` and compresses as opaque bytes.
 
 ## Editing map
 
@@ -64,4 +80,6 @@ word followed by `{`, then a structural check of the top-level ONNX fields. A pa
   variant in `types.rs`, and the spec.
 - New ggml type: a `Dtype` id and name in `types.rs`, its `BLOCK_*` geometry in `chain.rs`, the spec,
   then `ggml_type_of` in `gguf.rs`. A field table, and so a range, is a separate ratio decision.
+- Legacy torch recognition (new protocol, another magic): `legacy_torch.rs`; what counts as a
+  weight file: `classify_weight` in `mod.rs`.
 - Bounds of hostile input: the `MAX_*` constants at the top of each parser and in `mod.rs`.

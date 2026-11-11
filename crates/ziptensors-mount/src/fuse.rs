@@ -5,11 +5,12 @@
 //! Main responsibilities:
 //! - `FuseFs`, the `fuser::Filesystem` over `Arc<MountFs>`: lookups, attributes, listings, opens with
 //!   `FOPEN_KEEP_CACHE`, reads; every change and every write open is refused;
-//! - [`mount`] and [`MountHandle`]: a mount served by background threads, unmounted on drop;
+//! - [`mount`] and [`MountHandle`]: a mount served by background threads, ended by
+//!   [`MountHandle::unmount`], [`MountHandle::wait`] or its drop, under the contract of `handle.rs`;
 //! - [`UnmountSignals`] and [`run_until_signal`]: a foreground mount that a first SIGINT, SIGTERM or
 //!   SIGHUP unmounts and a second one abandons ([`MountEnd`]).
 //!
-//! Key structures: [`FuseOptions`], [`MountHandle`], [`MountEnd`], [`UnmountSignals`], `FuseFs`.
+//! Key structures: [`FuseOptions`], [`MountHandle`], [`UnmountSignals`], `FuseFs`.
 //!
 //! Implementation notes:
 //! - Contents never change while mounted, so attributes and entries live an hour in the kernel and
@@ -50,8 +51,9 @@ use nix::fcntl::OFlag;
 use nix::sys::signal::{SigSet, Signal};
 use nix::unistd::{getgid, getuid};
 
-use crate::error::FsError;
+use crate::error::{FsError, MountError};
 use crate::fs::{Access, Attr, MountFs};
+use crate::handle::MountEnd;
 use crate::tree::{NodeId, NodeKind};
 
 /// How long the kernel may keep attributes and lookups. Nothing changes while mounted.
@@ -288,6 +290,7 @@ fn lock(unmounter: &Mutex<SessionUnmounter>) -> MutexGuard<'_, SessionUnmounter>
 /// A live FUSE mount. Dropping it unmounts and waits for the session to end, which is when the last
 /// file open under the mount is closed (the unmount is lazy). When the mount is still listed after the
 /// unmount, the failure is logged, nothing waits, and the session thread is left to the process.
+/// `Send`, not `Sync`.
 #[derive(Debug)]
 pub struct MountHandle {
     mountpoint: PathBuf,
@@ -309,33 +312,6 @@ enum Event {
     Ended,
     /// A second signal: stop waiting for the session.
     Abandoned(Signal),
-}
-
-/// How a foreground mount ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MountEnd {
-    /// Unmounted, by a signal or from outside, and every file that was open under it closed.
-    Unmounted,
-    /// A second signal came while the session still served: files were still open, or the mount would
-    /// not go. The session thread is detached; the caller should end the process now, with
-    /// [`MountEnd::exit_code`], which cuts off the remaining readers.
-    Abandoned {
-        /// The second signal.
-        signal: Signal,
-    },
-}
-
-impl MountEnd {
-    /// The exit status for this end: 0, or 128 + the signal number for an abandoned mount (130 for a
-    /// second Ctrl-C), the shell convention for a death by signal.
-    #[must_use]
-    pub fn exit_code(self) -> u8 {
-        match self {
-            Self::Unmounted => 0,
-            // Signal numbers of SIGINT, SIGTERM and SIGHUP are below 128, so the sum fits.
-            Self::Abandoned { signal } => u8::try_from(128 + signal as i32).unwrap_or(u8::MAX),
-        }
-    }
 }
 
 /// Mounts `fs` at `mountpoint`, read-only and private to the calling user, and serves it from
@@ -386,25 +362,29 @@ impl MountHandle {
     }
 
     /// Unmounts and waits for the session to end, so for every file still open under the mount to be
-    /// closed.
+    /// closed. Blocks the calling thread for as long as such a file stays open.
     ///
     /// # Errors
-    /// The mount is still listed after the unmount (a failed `fusermount3`, or `umount2` as root): the
-    /// session thread is then detached and the mount stays. Otherwise the session's own final error.
-    pub fn unmount(mut self) -> io::Result<()> {
-        if let Err(error) = unmount_now(&self.unmounter, &self.listed) {
+    /// [`MountError::Unmount`] when the mount is still listed after the unmount (a failed
+    /// `fusermount3`, or `umount2` as root): the session thread is then detached and the mount stays.
+    /// [`MountError::Session`] for the session's own final error.
+    pub fn unmount(mut self) -> Result<(), MountError> {
+        if let Err(source) = unmount_now(&self.unmounter, &self.listed) {
             self.detach();
-            return Err(error);
+            return Err(MountError::Unmount { mountpoint: self.mountpoint.clone(), source });
         }
-        self.join()
+        self.join().map_err(|source| MountError::Session { mountpoint: self.mountpoint.clone(), source })
     }
 
-    /// Waits until the mount ends from outside, as `fusermount3 -u` does.
+    /// Waits until the mount ends from outside, as `fusermount3 -u` does, and every file open under it
+    /// is closed; returns [`MountEnd::Unmounted`]. Blocks the calling thread and takes no signal.
     ///
     /// # Errors
-    /// The session's final error.
-    pub fn wait(mut self) -> io::Result<()> {
+    /// [`MountError::Session`] for the session's final error.
+    pub fn wait(mut self) -> Result<MountEnd, MountError> {
         self.join()
+            .map(|()| MountEnd::Unmounted)
+            .map_err(|source| MountError::Session { mountpoint: self.mountpoint.clone(), source })
     }
 
     /// Joins the session thread, once.
@@ -568,7 +548,8 @@ pub fn run_until_signal(mut handle: MountHandle, signals: &UnmountSignals) -> io
         Event::Ended => handle.join().map(|()| MountEnd::Unmounted),
         Event::Abandoned(signal) => {
             handle.detach();
-            Ok(MountEnd::Abandoned { signal })
+            // A fieldless `repr(i32)` enum whose values are the libc signal numbers: lossless.
+            Ok(MountEnd::Abandoned { signal: signal as i32 })
         }
     };
     done.store(true, Ordering::SeqCst);
@@ -660,9 +641,7 @@ fn watch(set: SigSet, unmounter: &Mutex<SessionUnmounter>, listed: &Path, done: 
 mod tests {
     use std::path::Path;
 
-    use nix::sys::signal::Signal;
-
-    use super::{MountEnd, Step, Watch, listed_in, on_signal};
+    use super::{Step, Watch, listed_in, on_signal};
 
     #[test]
     fn the_first_signal_unmounts_the_second_abandons_and_the_end_stops() {
@@ -670,14 +649,6 @@ mod tests {
         assert_eq!(on_signal(Watch::Unmounting, false), (Watch::Unmounting, Step::Abandon));
         assert_eq!(on_signal(Watch::Serving, true), (Watch::Serving, Step::Stop));
         assert_eq!(on_signal(Watch::Unmounting, true), (Watch::Unmounting, Step::Stop));
-    }
-
-    #[test]
-    fn exit_codes_follow_the_shell_convention() {
-        assert_eq!(MountEnd::Unmounted.exit_code(), 0);
-        assert_eq!(MountEnd::Abandoned { signal: Signal::SIGINT }.exit_code(), 130);
-        assert_eq!(MountEnd::Abandoned { signal: Signal::SIGTERM }.exit_code(), 143);
-        assert_eq!(MountEnd::Abandoned { signal: Signal::SIGHUP }.exit_code(), 129);
     }
 
     #[test]

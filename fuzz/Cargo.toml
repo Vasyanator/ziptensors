@@ -1,4 +1,4 @@
-# ziptensors-fuzz: fuzz targets over the three surfaces that take untrusted bytes. Nightly, Linux only.
+# ziptensors-fuzz: fuzz targets over the four surfaces that take untrusted bytes. Nightly, Linux only.
 # Outside the workspace (root `exclude`), with its own lockfile. See MODULE_README.md for how to run it.
 
 [package]
@@ -40,6 +40,13 @@ bench = false
 [[bin]]
 name = "profile_scan"
 path = "fuzz_targets/profile_scan.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "recover_scan"
+path = "fuzz_targets/recover_scan.rs"
 test = false
 doc = false
 bench = false

@@ -14,6 +14,9 @@ documentation = "https://docs.rs/ziptensors-core"
 readme = "README.md"
 keywords = ["tensor", "safetensors", "gguf", "compression", "lossless"]
 categories = ["compression", "encoding", "artificial-intelligence"]
+# `tests/malicious.rs` compiles `fuzz/src/harness.rs` from outside this package, so it cannot build
+# from the published tarball; it runs from the repository only.
+exclude = ["tests/malicious.rs"]
 
 [dependencies]
 zstd.workspace = true

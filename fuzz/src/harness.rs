@@ -3,12 +3,13 @@
 //! same functions on stable.
 //!
 //! Main responsibilities:
-//! - [`open_and_read`], [`decode_chunk`] and [`profile_scan`]: feed untrusted bytes to one public
-//!   surface and panic on anything that is not a typed error of the right class;
+//! - [`open_and_read`], [`decode_chunk`], [`profile_scan`] and [`recover_scan`]: feed untrusted
+//!   bytes to one public surface and panic on anything that is not a typed error of the right class;
 //! - [`assemble`], [`assemble_with`] and [`to_fixed_up_input`]: the input form that reaches past the
 //!   file's hashes;
 //! - [`sample`]: a small valid container touching every chain, view and stream codec;
-//!   [`delta_sample`]: the same for delta blobs (spec section 7a);
+//!   [`delta_sample`]: the same for delta blobs (spec section 7a); [`append_generation`]: a second
+//!   generation after a valid file (spec section 9.3);
 //! - [`Prng`] and [`mutate`]: seeded mutation for `crates/ziptensors-core/tests/malicious.rs`.
 //!
 //! Key structures: [`Bytes`], [`Sample`], [`Prng`].
@@ -38,10 +39,12 @@ use ziptensors_core::format::{
     BlobRecord, ChunkRecord, DeltaParams, ExtentRecord, Footer, HEADER_LEN, Header, IndexBuilder,
     MemberRecord, TensorRecord, check_restore_name, parse_footer, parse_header,
 };
+use ziptensors_core::io::PrefixSource;
 use ziptensors_core::profile::{MIN_RANGE_BYTES, normalize, scan, width_trial};
 use ziptensors_core::{
-    Chain, Container, DeltaOp, Dtype, ElementWidth, Error, ErrorCode, FieldTable, Layout, Member,
-    OpenOptions, Profile, RandomAccess, ReadRequest, Step, Verify, View,
+    Candidate, Chain, Container, DeltaOp, Dtype, ElementWidth, Error, ErrorCode, FieldTable, Layout,
+    Member, OpenOptions, Profile, RandomAccess, ReadRequest, Scan, ScanBudget, ScanOutcome, Step,
+    Verify, View, find_last_valid_generation,
 };
 
 /// Index cap of the harness. Far under the default, so one input costs milliseconds, not a 256 MiB
@@ -159,7 +162,8 @@ pub fn assemble_with(data: &[u8], raw_index: &[u8], required_features: u64) -> V
     file.extend_from_slice(data);
     let index_offset = to_u64(file.len());
     file.extend_from_slice(&stored);
-    let footer = Footer::for_index(index_offset, to_u64(stored.len()), raw_index);
+    let generation = ziptensors_core::format::GENERATION_INITIAL;
+    let footer = Footer::for_index(index_offset, to_u64(stored.len()), raw_index, generation);
     file.extend_from_slice(&footer.to_bytes());
     file
 }
@@ -586,6 +590,142 @@ pub fn profile_scan(input: &[u8]) {
     assert_eq!(normalize(once.clone(), file_len), once, "normalize is not idempotent");
     let width = width_trial(input);
     assert!(matches!(width, 1 | 2 | 4 | 8), "width trial gave {width}");
+}
+
+/// `file`, a valid container, with a next generation appended that names the same records: its
+/// stored index copied after its footer, then a footer for the copy with the generation one higher.
+/// This is what an append without new data writes (spec section 9.3).
+///
+/// # Panics
+/// If `file` is not valid, since this builds fixtures and never reads untrusted input.
+#[must_use]
+pub fn append_generation(file: &[u8]) -> Vec<u8> {
+    let tail = file.len() - 64;
+    let footer: &[u8; 64] = file[tail..].try_into().expect("64 bytes");
+    let footer = parse_footer(footer).expect("a valid footer");
+    let index_offset = usize::try_from(footer.index_offset).expect("a small file");
+    let mut next = file.to_vec();
+    next.extend_from_slice(&file[index_offset..tail]);
+    let moved =
+        Footer { index_offset: to_u64(file.len()), generation: footer.generation + 1, ..footer };
+    next.extend_from_slice(&moved.to_bytes());
+    next
+}
+
+/// Options of the scan in [`recover_scan`]: the harness limits on one thread.
+fn scan_options() -> OpenOptions {
+    OpenOptions {
+        threads: 1,
+        max_index_bytes: MAX_INDEX_BYTES,
+        max_total_decoded: MAX_TOTAL_DECODED,
+        ..OpenOptions::default()
+    }
+}
+
+/// Target `recover_scan`: any bytes as a file to recover, scanned by `find_last_valid_generation`
+/// under a loose and a tight budget. Reads only; `recover` itself adds the file operations and the
+/// verification, which `open_and_read` covers.
+///
+/// The first byte selects the form. Bit 0 clear: the rest is the file. Bit 0 set: `u32` data length,
+/// `u32` index length, the data region, the raw index, then a tail; the file is a container
+/// assembled with valid hashes from the first two, followed by the tail, which is how a torn append
+/// looks; bit 1 sets required feature bit 0 in its header, as in [`open_and_read`]. The top four bits
+/// scale the tight budget's byte bound, in sixteenths of the file length.
+///
+/// # Panics
+/// On any behaviour outside the contract of the scan, which is a finding: a panic, an error other
+/// than a refusal of the file, a bound exceeded, a found generation that does not open as a prefix
+/// or differs between the budgets, or a valid file or prefix the scan does not find.
+pub fn recover_scan(input: &[u8]) {
+    let Some((form, rest)) = input.split_first() else {
+        return;
+    };
+    let (file, assembled_len) = if form & 1 == FORM_FIXED_UP {
+        let Some((data_len, rest)) = rest.split_first_chunk::<4>() else {
+            return;
+        };
+        let Some((index_len, rest)) = rest.split_first_chunk::<4>() else {
+            return;
+        };
+        let clamp = |len: &[u8; 4], within: &[u8]| {
+            usize::try_from(u32::from_le_bytes(*len)).map_or(within.len(), |len| len.min(within.len()))
+        };
+        let (data, rest) = rest.split_at(clamp(data_len, rest));
+        let (raw_index, tail) = rest.split_at(clamp(index_len, rest));
+        let features = if form & FORM_DELTA_FEATURE == 0 { 0 } else { FEATURE_DELTA };
+        let mut file = assemble_with(data, raw_index, features);
+        let assembled_len = file.len();
+        file.extend_from_slice(tail);
+        (file, Some(assembled_len))
+    } else {
+        (rest.to_vec(), None)
+    };
+    let len = to_u64(file.len());
+    let source: Arc<dyn RandomAccess> = Arc::new(Bytes(file));
+    let options = scan_options();
+    let loose = ScanBudget { max_candidates: 8, max_scan_bytes: u64::MAX };
+    let tight = ScanBudget { max_candidates: 1, max_scan_bytes: len / 16 * u64::from(form >> 4) };
+    let first = checked_scan(&source, &loose);
+    let second = checked_scan(&source, &tight);
+    if let Some(ScanOutcome::Found(candidate)) = second.map(|scan| scan.outcome) {
+        // The scan order does not depend on the budget, so a tight scan that finds a generation finds
+        // the one a loose scan finds first.
+        let loose = first.map(|scan| scan.outcome);
+        assert_eq!(loose, Some(ScanOutcome::Found(candidate)), "budgets disagree");
+    }
+    if Container::from_source(Arc::clone(&source), &options).is_ok() {
+        let at_end = ScanOutcome::Found(Candidate { valid_len: len, generation: footer_generation(&source, len) });
+        assert_eq!(first.map(|scan| scan.outcome), Some(at_end), "a valid file is not found at its end");
+    }
+    let Some(assembled_len) = assembled_len.map(to_u64) else {
+        return;
+    };
+    let prefix = PrefixSource::new(Arc::clone(&source), assembled_len).expect("inside the file");
+    if Container::from_source(Arc::new(prefix), &options).is_ok() {
+        // A valid generation lies at the start of the tail; the scan finds it or a later one, unless
+        // the candidates ran out or a later candidate cannot be judged (`first` is then `None`).
+        if let Some(scan) = first {
+            match scan.outcome {
+                ScanOutcome::Found(candidate) => {
+                    assert!(candidate.valid_len >= assembled_len, "an older generation: {scan:?}");
+                }
+                ScanOutcome::CandidatesExhausted => {}
+                ScanOutcome::NoCandidate | ScanOutcome::ScanBytesExhausted => {
+                    panic!("the assembled generation is missed: {scan:?}")
+                }
+            }
+        }
+    }
+}
+
+/// Runs the scan and checks what holds for any input: its bounds, and that a found generation opens
+/// as a prefix. Returns `None` when the scan refused the file, which must be with an open error.
+fn checked_scan(source: &Arc<dyn RandomAccess>, budget: &ScanBudget) -> Option<Scan> {
+    let scan = match find_last_valid_generation(source, &scan_options(), budget) {
+        Ok(scan) => scan,
+        Err(error) => {
+            assert!(open_error(&error), "scan gave {error:?}");
+            return None;
+        }
+    };
+    assert!(scan.scanned_bytes <= budget.max_scan_bytes, "{scan:?} over {budget:?}");
+    assert!(scan.candidates_checked <= budget.max_candidates, "{scan:?} over {budget:?}");
+    if let ScanOutcome::Found(candidate) = scan.outcome {
+        assert!(candidate.valid_len <= source.len(), "{scan:?}");
+        let prefix = PrefixSource::new(Arc::clone(source), candidate.valid_len).expect("inside");
+        let opened = Container::from_source(Arc::new(prefix), &scan_options());
+        assert!(opened.is_ok(), "a found generation does not open: {scan:?}, {opened:?}");
+        let generation = footer_generation(source, candidate.valid_len);
+        assert_eq!(candidate.generation, generation, "{scan:?}");
+    }
+    Some(scan)
+}
+
+/// The `generation` of the footer that ends at `end` of `source`, which an open has checked.
+fn footer_generation(source: &Arc<dyn RandomAccess>, end: u64) -> u64 {
+    let mut footer = [0; 64];
+    source.read_exact_at(end - 64, &mut footer).expect("inside the file");
+    parse_footer(&footer).expect("a checked footer").generation
 }
 
 /// A valid container and what it holds.

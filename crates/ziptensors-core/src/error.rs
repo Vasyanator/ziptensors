@@ -64,8 +64,8 @@ pub enum Error {
     },
 
     /// The header, footer or index violates the format. `section` is a section tag or one of
-    /// `"header"`, `"footer"`, `"index"`.
-    #[error("malformed index in {section}: {detail}")]
+    /// `"header"`, `"footer"`, `"index"`. The message names the place as [`malformed_place`] words it.
+    #[error("malformed {}: {detail}", malformed_place(section))]
     MalformedIndex {
         /// Where the violation was found.
         section: &'static str,
@@ -208,6 +208,90 @@ pub enum Error {
         /// Error of opening or syncing the directory.
         source: std::io::Error,
     },
+
+    /// An in-place rewrite of `path` failed after its first move of existing bytes, or its result did
+    /// not verify, so the file holds neither the old container nor a correct new one. Before that
+    /// first move an in-place edit fails with the plain error and leaves the file intact; this variant
+    /// alone means the file is damaged. The file is left as it is, so members the failure did not
+    /// touch may still read, but the user should restore it from a backup or repack it from the
+    /// original inputs.
+    #[error("{} is damaged: the in-place edit failed after it began moving data: {cause}", path.display())]
+    DamagedInPlace {
+        /// The container that was being rewritten.
+        path: PathBuf,
+        /// The failure that stopped the rewrite. `source()` yields this box itself, so a caller
+        /// walking the chain downcasts that link to `Box<Error>`, not to `Error`.
+        #[source]
+        cause: Box<Error>,
+    },
+
+    /// An edit request cannot be applied as asked, for example a delta member while the container's
+    /// header does not allow deltas in the chosen strategy, a repack together with an append or
+    /// in-place strategy, a delta base that names a member kept in place, or an empty list of
+    /// operations where one is required. Raised before anything is written: the container is
+    /// unchanged. The user changes the request, usually the strategy.
+    #[error("edit refused: {detail}")]
+    EditRefused {
+        /// Why the request cannot be applied, for humans.
+        detail: String,
+    },
+
+    /// `path` holds a complete, valid container in its first `valid_len` bytes, followed by bytes that
+    /// could not be cut off: an append that failed and could not truncate its partial tail (the valid
+    /// container is then the previous one), or an in-place edit whose final shrink failed, for example
+    /// because another process maps the file on Windows (the valid container is then the new one).
+    /// The file does not open as it is, because a reader looks for the footer at its end; `recover`
+    /// truncates it to `valid_len` once nothing else holds the file.
+    #[error(
+        "{} holds a valid container in its first {valid_len} bytes, followed by bytes that could not be removed",
+        path.display()
+    )]
+    TrailingBytes {
+        /// The container file.
+        path: PathBuf,
+        /// Length of the valid container at the start of the file, in bytes.
+        valid_len: u64,
+    },
+
+    /// `recover` found no valid generation of a container in `path` within the bytes it was allowed to
+    /// scan. Nothing was changed. The file cannot be repaired by this library; the user restores it
+    /// from a backup.
+    #[error("no valid container found in {} after scanning {scanned} bytes", path.display())]
+    Unrecoverable {
+        /// The file that was scanned.
+        path: PathBuf,
+        /// Number of bytes examined before giving up.
+        scanned: u64,
+    },
+
+    /// A tree operation (`tree::compress_tree`, `tree::decompress_tree`) found names that collide,
+    /// such as two weight files that would get one container name, a container name already taken
+    /// by another file, or two containers that restore to one name. The whole run is refused before
+    /// anything is written: the tree is unchanged. The user renames or removes the files named.
+    #[error(
+        "{} name conflicts under {}, nothing was written: {}",
+        conflicts.len(),
+        root.display(),
+        conflicts.join("; ")
+    )]
+    TreeConflict {
+        /// The root of the run.
+        root: PathBuf,
+        /// One description per conflict, naming every file involved, for humans.
+        conflicts: Vec<String>,
+    },
+
+    /// A write request would store two members under one name: two inputs of a pack that get the
+    /// same member name, a member added or copied into a pack that already holds one called that, or
+    /// two containers of a merge that share a member name. Raised before that member is written; a
+    /// pack or merge checks every name before it starts the output. A container whose index holds a
+    /// duplicate name is damaged, not this: that is [`Error::MalformedIndex`] for `MEMB`. The user
+    /// renames one of the inputs.
+    #[error("member name {name:?} is used twice in one container")]
+    DuplicateMember {
+        /// The member name requested twice.
+        name: String,
+    },
 }
 
 /// Stable numeric identity of an [`Error`] variant, for the C ABI and other frontends.
@@ -258,6 +342,18 @@ pub enum ErrorCode {
     OutputIsInput = 19,
     /// [`Error::CommittedNotDurable`].
     CommittedNotDurable = 20,
+    /// [`Error::DamagedInPlace`].
+    DamagedInPlace = 21,
+    /// [`Error::EditRefused`].
+    EditRefused = 22,
+    /// [`Error::TrailingBytes`].
+    TrailingBytes = 23,
+    /// [`Error::Unrecoverable`].
+    Unrecoverable = 24,
+    /// [`Error::TreeConflict`].
+    TreeConflict = 25,
+    /// [`Error::DuplicateMember`].
+    DuplicateMember = 26,
 }
 
 impl ErrorCode {
@@ -294,7 +390,22 @@ impl Error {
             Self::SymlinkInput { .. } => ErrorCode::SymlinkInput,
             Self::OutputIsInput { .. } => ErrorCode::OutputIsInput,
             Self::CommittedNotDurable { .. } => ErrorCode::CommittedNotDurable,
+            Self::DamagedInPlace { .. } => ErrorCode::DamagedInPlace,
+            Self::EditRefused { .. } => ErrorCode::EditRefused,
+            Self::TrailingBytes { .. } => ErrorCode::TrailingBytes,
+            Self::Unrecoverable { .. } => ErrorCode::Unrecoverable,
+            Self::TreeConflict { .. } => ErrorCode::TreeConflict,
+            Self::DuplicateMember { .. } => ErrorCode::DuplicateMember,
         }
+    }
+}
+
+/// The words of [`Error::MalformedIndex`] for `section`: `index`, `header` and `footer` as they
+/// are, a section tag as `index section <TAG>`, so that no message reads "index in index".
+fn malformed_place(section: &str) -> String {
+    match section {
+        "index" | "header" | "footer" => section.to_owned(),
+        tag => format!("index section {tag}"),
     }
 }
 
@@ -304,6 +415,15 @@ mod tests {
     use std::collections::HashSet;
     use std::error::Error as _;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_malformed_index_names_its_place_once() {
+        let message = |section| Error::MalformedIndex { section, detail: "x".to_owned() }.to_string();
+        assert_eq!(message("index"), "malformed index: x");
+        assert_eq!(message("footer"), "malformed footer: x");
+        assert_eq!(message("header"), "malformed header: x");
+        assert_eq!(message("MEMB"), "malformed index section MEMB: x");
+    }
 
     #[test]
     fn error_crosses_threads() {
@@ -363,6 +483,20 @@ mod tests {
                 ErrorCode::CommittedNotDurable,
                 20,
             ),
+            (
+                Error::DamagedInPlace { path: PathBuf::new(), cause: Box::new(Error::NotZiptensors) },
+                ErrorCode::DamagedInPlace,
+                21,
+            ),
+            (Error::EditRefused { detail: text() }, ErrorCode::EditRefused, 22),
+            (Error::TrailingBytes { path: PathBuf::new(), valid_len: 0 }, ErrorCode::TrailingBytes, 23),
+            (Error::Unrecoverable { path: PathBuf::new(), scanned: 0 }, ErrorCode::Unrecoverable, 24),
+            (
+                Error::TreeConflict { root: PathBuf::new(), conflicts: Vec::new() },
+                ErrorCode::TreeConflict,
+                25,
+            ),
+            (Error::DuplicateMember { name: text() }, ErrorCode::DuplicateMember, 26),
         ]
     }
 
@@ -406,6 +540,46 @@ mod tests {
         assert!(text.contains("power loss"), "{text}");
         assert!(text.contains("disk on fire"), "{text}");
         assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn damaged_in_place_says_so_and_keeps_its_cause() {
+        let err = Error::DamagedInPlace {
+            path: PathBuf::from("model.ziptensors"),
+            cause: Box::new(Error::Io {
+                op: "write_all_at",
+                path: PathBuf::from("model.ziptensors"),
+                source: std::io::Error::other("disk on fire"),
+            }),
+        };
+        let text = err.to_string();
+        assert!(text.starts_with("model.ziptensors is damaged"), "{text}");
+        assert!(text.contains("disk on fire"), "{text}");
+        let cause = err.source().expect("a cause");
+        let inner = cause.downcast_ref::<Box<Error>>().expect("the source is the boxed cause");
+        assert_eq!(inner.code(), ErrorCode::Io);
+    }
+
+    #[test]
+    fn trailing_bytes_and_unrecoverable_name_their_numbers() {
+        let trailing = Error::TrailingBytes { path: PathBuf::from("m.zt"), valid_len: 4096 };
+        let text = trailing.to_string();
+        assert!(text.contains("m.zt") && text.contains("4096"), "{text}");
+        let lost = Error::Unrecoverable { path: PathBuf::from("m.zt"), scanned: 77 };
+        let text = lost.to_string();
+        assert!(text.contains("m.zt") && text.contains("77"), "{text}");
+    }
+
+    #[test]
+    fn tree_conflict_names_every_conflict_and_says_nothing_was_written() {
+        let err = Error::TreeConflict {
+            root: PathBuf::from("models"),
+            conflicts: vec!["a and b both map to c".to_owned(), "d is taken".to_owned()],
+        };
+        let text = err.to_string();
+        assert!(text.starts_with("2 name conflicts under models"), "{text}");
+        assert!(text.contains("nothing was written"), "{text}");
+        assert!(text.contains("a and b both map to c; d is taken"), "{text}");
     }
 
     #[test]
